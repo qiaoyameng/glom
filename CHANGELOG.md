@@ -12,6 +12,15 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `glom.compile_projection()` (with `glom.Field` and
+  `glom.CompiledProjection`) for precompiling fixed field projections
+  of explicit `Path`/`T` accessors. Reads through declared pure-read
+  types are shared across fields with common path prefixes within a
+  single record, while undeclared custom types keep plain glom
+  evaluation order and per-field reads.
+
 ## 25.12.0
 
 _(December 28, 2025)_
