@@ -10,6 +10,16 @@ from glom.core import format_oneline_trace, format_target_spec_trace, bbrepr, RO
 from glom.matching import M, MatchError, TypeMatchError, Match
 
 
+class _FormWrite:
+    """adapter spec which runs a Form write-back through glom()"""
+    def __init__(self, form, view):
+        self.form = form
+        self.view = view
+
+    def glomit(self, target, scope):
+        return self.form.write(target, self.view)
+
+
 # basic tests:
 
 def test_good_error():
@@ -502,6 +512,17 @@ def test_all_public_errors():
     _test_exc(MatchError, 1, M == 2)
 
     _test_exc(TypeMatchError, 1, Match(str))
+
+    _test_exc(glom.FormError, {'n': 1},
+              _FormWrite(glom.Form({'n': glom.Field('n')}), {'n': 1, 'x': 2}))
+
+    _test_exc(glom.FieldNotWritableError, {'n': 1},
+              _FormWrite(glom.Form({'n': glom.Field('n', forward=str)}), {'n': '2'}))
+
+    conflict_form = glom.Form({'a': glom.Field('n', forward=str, backward=int),
+                               'b': glom.Field('n', forward=str, backward=float)})
+    _test_exc(glom.FormConflictError, {'n': 1},
+              _FormWrite(conflict_form, {'a': '2', 'b': '2.5'}))
 
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc

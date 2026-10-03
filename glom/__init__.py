@@ -43,6 +43,8 @@ from glom.matching import (M,
                            CheckError)
 from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 
+from glom.form import Form, Field, FormError, FormConflictError, FieldNotWritableError
+
 # there's no -ion word that really fits what "streaming" means.
 # generation, production, iteration, all have more relevant meanings
 # elsewhere. (maybe procrastination :P)
