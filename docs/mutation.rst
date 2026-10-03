@@ -15,6 +15,20 @@ Deeply assign within an existing structure, given a path and a value.
 
 .. autoclass:: glom.Assign
 
+Leaf-wise update
+----------------
+
+Update each destination at a path from its own old value, with access
+to the original target and the call arguments.
+
+.. autofunction:: glom.update
+
+.. autoclass:: glom.Update
+
+   .. autoattribute:: glom.mutation.UPDATE_TARGET
+
+   .. autoattribute:: glom.mutation.UPDATE_ARGS
+
 Deletion
 --------
 
@@ -29,5 +43,7 @@ Exceptions
 ----------
 
 .. autoclass:: glom.PathAssignError
+
+.. autoclass:: glom.PathUpdateError
 
 .. autoclass:: glom.PathDeleteError

@@ -499,6 +499,10 @@ def test_all_public_errors():
 
     _test_exc(glom.PathDeleteError, object(), glom.Delete('a'))
 
+    _test_exc(glom.PathUpdateError,
+              {'a': {'b': 1}},
+              glom.Update('a.b', T['boom']))
+
     _test_exc(MatchError, 1, M == 2)
 
     _test_exc(TypeMatchError, 1, Match(str))

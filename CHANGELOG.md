@@ -12,6 +12,19 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `Update` specifier type and `update()` convenience function for
+  leaf-wise in-place mutation: each destination at a path (including
+  wildcard matches) is recomputed from its own old value, with explicit
+  `UPDATE_TARGET` and `UPDATE_ARGS` scope entries for the original
+  target and call arguments. Duplicate physical leaves from wildcard
+  matches update once, in first-discovery order. Missing paths raise by
+  default, or can be skipped (`skip_missing=True`) or created
+  (`missing=callable`). Failures raise `PathUpdateError`, which reports
+  how many leaves were already updated and that those changes are
+  retained. `Assign` semantics are unchanged.
+
 ## 25.12.0
 
 _(December 28, 2025)_
