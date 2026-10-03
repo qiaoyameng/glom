@@ -6,7 +6,7 @@ import pytest
 from glom import glom, S, Val, T, A, Fill, Ref, Coalesce, STOP, Switch
 from glom.matching import (
     Match, M, MatchError, TypeMatchError, And, Or, Not,
-    Optional, Required, Regex)
+    Optional, Required, Regex, MatchCollectError, TRUNCATED)
 from glom.core import Auto, SKIP, Ref
 
 try:
@@ -508,3 +508,121 @@ def test_switch():
 
 def test_nested_dict():
     assert glom({1: 2}, Match({A.t: S.t})) == {1: 1}
+
+
+def test_collect_basic_empty_on_success():
+    spec = Match({'id': int})
+    assert spec.collect({'id': 1}) == []
+    assert spec.validate({'id': 1}) == {'id': 1}
+
+
+def test_collect_gathers_multiple_failures_with_paths():
+    spec = Match({'name': str,
+                  Optional('nickname', default='<none>'): str,
+                  'records': [{'id': int, 'kind': Or('x', 'y')}]})
+    target = {'records': [
+        {'id': 1, 'kind': 'x'},
+        {'id': 'two', 'kind': 'z'},
+    ]}
+    failures = spec.collect(target)
+
+    paths = [f.path for f in failures]
+    assert ('records', 1, 'id') in paths
+    assert ('records', 1, 'kind') in paths
+    assert ('name',) in paths
+
+    id_failure = next(f for f in failures if f.path == ('records', 1, 'id'))
+    assert isinstance(id_failure.error, TypeMatchError)
+    assert id_failure.path_str == "$['records'][1]['id']"
+
+    kind_failure = next(f for f in failures if f.path == ('records', 1, 'kind'))
+    # Or attempts are detail on one logical failure, not user errors
+    assert len([f for f in failures]) == 3
+    assert kind_failure.branches is not None
+    attempt_msgs = [bf.message for branch in kind_failure.branches for bf in branch]
+    assert "'z' does not match 'x'" in attempt_msgs
+    assert "'z' does not match 'y'" in attempt_msgs
+
+    # validate raises a structured error and never returns a half result
+    with pytest.raises(MatchCollectError) as exc_info:
+        spec.validate(target)
+    collected = exc_info.value
+    assert len(collected.failures) == 3
+    assert collected.truncated is False
+
+
+def test_collect_success_still_computes_defaults():
+    spec = Match({'id': int, Optional('tag', default='d'): str})
+    assert spec.validate({'id': 1}) == {'id': 1, 'tag': 'd'}
+
+
+def test_collect_list_element_multipattern_is_one_logical_failure():
+    failures = Match([Or(int, str)]).collect([[]])
+    assert len(failures) == 1
+    assert failures[0].path == (0,)
+    assert failures[0].branches is not None
+
+
+def test_collect_max_failures_truncation():
+    failures = Match([int]).collect(['a', 'b', 'c', 'd'], max_failures=2)
+    real = [f for f in failures if f is not TRUNCATED]
+    assert len(real) == 2
+    assert failures[-1] is TRUNCATED
+
+    with pytest.raises(MatchCollectError) as exc_info:
+        Match([int]).validate(['a', 'b'], max_failures=1)
+    assert exc_info.value.truncated is True
+
+
+def test_collect_required_missing_key_path():
+    failures = Match({Required(str): int}).collect({})
+    assert len(failures) == 1
+    assert failures[0].path == ()
+    assert 'missing expected key' in failures[0].message
+
+
+def test_collect_nonmatch_exception_propagates():
+    def boom(target):
+        raise RuntimeError('kaboom')
+    with pytest.raises(RuntimeError) as exc_info:
+        Match(boom).collect(1)
+    assert type(exc_info.value) is RuntimeError
+
+
+def test_collect_callable_matcherror_is_collected():
+    def check(target):
+        raise MatchError('explicit match failure: {0!r}', target)
+    failures = Match(check).collect(1)
+    assert len(failures) == 1
+    assert 'explicit match failure' in failures[0].message
+
+
+def test_collect_bool_defaults_match_normal_semantics():
+    # Or/And with default are not failures, mirroring normal Bool.glomit
+    assert Match(Or(int, default=9)).validate('x') == 9
+    assert Match(And(int, default=9)).validate('x') == 9
+    assert Match(Or(int, default=9)).collect('x') == []
+
+
+def test_collect_failure_repr():
+    failures = Match({'a': int}).collect({'a': 'x'})
+    assert failures[0].path == ('a',)
+    assert 'MatchFailure(' in repr(failures[0])
+
+
+def test_collect_plain_match_still_raises_first_error():
+    # backwards-compatible: normal glom/Match usage is fail-fast
+    with pytest.raises(TypeMatchError):
+        glom({'a': 'x'}, Match({'a': int}))
+    assert Match(int).matches(1) is True
+    assert Match(int).matches('x') is False
+
+
+def test_collect_max_failures_validation():
+    with pytest.raises(ValueError):
+        Match(int).collect(1, max_failures=-1)
+    with pytest.raises(ValueError):
+        Match(int).collect(1, max_failures=1.5)
+    # zero means "no failures retained", still reports truncation
+    failures = Match(int).collect('x', max_failures=0)
+    assert failures == [TRUNCATED]

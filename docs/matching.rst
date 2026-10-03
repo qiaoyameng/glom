@@ -47,6 +47,41 @@ and :class:`~glom.Optional`.
 
 .. autoclass:: glom.Required
 
+Collecting every failure
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A normal :class:`~glom.Match` raises at the first problem, which can
+turn multi-field validation into a back-and-forth of submit, fix one
+field, and resubmit. ``Match`` has two explicit collection entrypoints
+which check the whole structure and report every problem at once:
+
+- ``Match.validate(target, max_failures=None)`` returns the matched
+  result on success, or raises :class:`~glom.MatchCollectError` whose
+  ``failures`` attribute is a list of :class:`~glom.MatchFailure`.
+- ``Match.collect(target, max_failures=None)`` returns just that list
+  (empty on success), so no half-built transform result is ever
+  mistaken for valid data.
+
+Each :class:`~glom.MatchFailure` carries the original ``path`` to the
+offending value (dict keys and list indices), a ``message``, the
+underlying ``error``, and, for an :class:`~glom.Or` whose branches all
+fail, a ``branches`` list. An :class:`~glom.Or` (or a list element
+with several candidate patterns) is always one logical failure; the
+individual attempts are attached as detail rather than counted as
+separate user errors.
+
+When *max_failures* is exceeded, collection stops and the
+:data:`~glom.TRUNCATED` sentinel is the last entry (and the raised
+error has ``truncated=True``). Defaults and conversions still use
+normal Match semantics on success. Exceptions raised from user
+callables that are not match failures propagate untouched.
+
+.. autoclass:: glom.MatchFailure
+
+.. autoclass:: glom.MatchCollectError
+
+.. autodata:: glom.TRUNCATED
+
 ``M`` Expressions
 ~~~~~~~~~~~~~~~~~
 
@@ -85,6 +120,8 @@ Exceptions
 .. autoclass:: glom.MatchError
 
 .. autoclass:: glom.TypeMatchError
+
+.. autoclass:: glom.MatchCollectError
 
 Validation with Check
 ~~~~~~~~~~~~~~~~~~~~~

@@ -7,7 +7,7 @@ import pytest
 
 from glom import glom, S, T, GlomError, PathAccessError, Switch, Coalesce, Or, Path
 from glom.core import format_oneline_trace, format_target_spec_trace, bbrepr, ROOT, LAST_CHILD_SCOPE
-from glom.matching import M, MatchError, TypeMatchError, Match
+from glom.matching import M, MatchError, TypeMatchError, Match, MatchCollectError
 
 
 # basic tests:
@@ -502,6 +502,8 @@ def test_all_public_errors():
     _test_exc(MatchError, 1, M == 2)
 
     _test_exc(TypeMatchError, 1, Match(str))
+
+    _test_exc(MatchCollectError, 1, Match(str)._collect_spec())
 
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc

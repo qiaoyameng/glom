@@ -14,10 +14,21 @@ from pprint import pprint
 from boltons.iterutils import is_iterable
 from boltons.typeutils import make_sentinel
 
-from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation, Path, chain_child, Val, arg_val
+from .core import (GlomError, glom, T, MODE, bbrepr, bbformat,
+                   format_invocation, Path, chain_child, Val, arg_val,
+                   _has_callable_glomit)
 
 
 _MISSING = make_sentinel('_MISSING')
+
+
+TRUNCATED = make_sentinel('TRUNCATED')
+TRUNCATED.__doc__ = '''
+The TRUNCATED singleton is appended as the final element of a
+Match.collect failure list when more failures were found than the
+requested max_failures limit. Check with 'TRUNCATED in failures'
+to detect truncation.
+'''
 
 
 # NOTE: it is important that MatchErrors be cheap to construct,
@@ -67,6 +78,78 @@ class TypeMatchError(MatchError, TypeError):
         # __init__ args = (actual, expected)
         # self.args = (fmt_str, expected, actual)
         return TypeMatchError(self.args[2], self.args[1])
+
+
+def _format_path(path):
+    if not path:
+        return '<root>'
+    parts = ['$']
+    for seg in path:
+        if type(seg) is int:
+            parts[-1] += '[%r]' % (seg,)
+        else:
+            parts[-1] += '[' + bbrepr(seg) + ']'
+    return parts[0]
+
+
+class MatchFailure:
+    """One structural validation failure produced by
+    Match.collect / Match.validate.
+
+    Attributes:
+       path (tuple): Original-location path from the validation root
+         to the failed value. Dict keys and list indices appear in
+         traversal order; an empty tuple means the root target failed.
+       message (str): Human-readable description of the failure.
+       error (MatchError): The underlying match error, useful for
+         programmatic inspection (e.g. TypeMatchError).
+       branches (list): Only set for an Or (or multi-pattern
+         list element) whose every branch failed. Each entry is a list
+         of MatchFailure objects describing that one attempt;
+         the enclosing failure is the single logical problem.
+    """
+    __slots__ = ('path', 'message', 'error', 'branches')
+
+    def __init__(self, path, message, error=None, branches=None):
+        self.path = tuple(path)
+        self.message = message
+        self.error = error
+        self.branches = branches
+
+    @property
+    def path_str(self):
+        """The path rendered in a bracket-access notation."""
+        return _format_path(self.path)
+
+    def __repr__(self):
+        rv = 'MatchFailure(path=%s, message=%r' % (self.path, self.message)
+        if self.branches:
+            rv += ', branches=%r' % (self.branches,)
+        return rv + ')'
+
+
+class MatchCollectError(MatchError):
+    """MatchError subtype raised by Match.validate when one or more
+    structural checks fail.
+
+    The structured, original-pathed results are available as the
+    failures attribute (a list of MatchFailure). When the failure
+    count hit the configured limit, the truncated attribute is True.
+    """
+    def __init__(self, failures, truncated=False):
+        self.failures = failures
+        self.truncated = truncated
+        super().__init__('collected match failure(s)')
+
+    def get_message(self):
+        count = len([f for f in self.failures if f is not TRUNCATED])
+        lines = ['match validation failed with %d error(s):' % count]
+        for failure in self.failures:
+            if failure is TRUNCATED:
+                lines.append(' - ... (further failures truncated)')
+            else:
+                lines.append(' - %s: %s' % (failure.path_str, failure.message))
+        return '\n'.join(lines)
 
 
 class Match:
@@ -184,6 +267,63 @@ class Match:
         except GlomError:
             return False
         return True
+
+    def validate(self, target, max_failures=None):
+        """Validate *target*, collecting every structural failure
+        instead of stopping at the first one.
+
+        On success, returns the matched result, with defaults and
+        conversions computed under normal Match semantics. On failure,
+        raises MatchCollectError whose failures attribute is a list
+        of MatchFailure objects carrying the original paths of every
+        problem.
+
+        An Or whose branches all fail is reported as one logical
+        failure (with per-attempt detail attached), rather than one
+        failure per internal attempt.
+
+        Exceptions raised by user callables which are not match
+        failures (i.e. not MatchError) are raised through untouched.
+
+        Pass *max_failures* to stop collecting after that many
+        problems; the error's truncated attribute is then True.
+        """
+        report = glom(target, self._collect_spec(max_failures))
+        if report.failures:
+            truncated = report.failures[-1] is TRUNCATED
+            raise MatchCollectError(report.failures, truncated)
+        if report.exc is not None:
+            raise report.exc
+        return report.result
+
+    def _collect_spec(self, max_failures=None):
+        """internal: specifier which raises MatchCollectError on failure
+        instead of stopping at the first MatchError."""
+        if max_failures is not None and (
+                type(max_failures) is not int or max_failures < 0):
+            raise ValueError(
+                "max_failures must be a non-negative int or None, not: %r"
+                % (max_failures,))
+        return _CollectMatch(self, max_failures)
+
+    def collect(self, target, max_failures=None):
+        """Validate *target* and return the list of
+        MatchFailure problems found, or an empty list when everything
+        matches.
+
+        This never returns a half-built transform result; use
+        validate when the matched value is also needed. When
+        *max_failures* is exceeded, the TRUNCATED sentinel is the
+        final element of the returned list.
+
+        Non-match exceptions raised by user callables are not
+        collected; they propagate as-is.
+        """
+        try:
+            self.validate(target, max_failures=max_failures)
+        except MatchCollectError as e:
+            return e.failures
+        return []
 
     def __repr__(self):
         return f'{self.__class__.__name__}({bbrepr(self.spec)})'
@@ -1052,3 +1192,291 @@ class CheckError(GlomError):
     def __repr__(self):
         cn = self.__class__.__name__
         return f'{cn}({self.msgs!r}, {self.check_obj!r}, {self.path!r})'
+
+
+# ---------------------------------------------------------------------------
+# failure collection mode
+# ---------------------------------------------------------------------------
+
+class _CollectReport:
+    __slots__ = ('result', 'failures', 'truncated', 'exc')
+
+    def __init__(self, result, failures, truncated, exc=None):
+        self.result = result
+        self.failures = failures
+        self.truncated = truncated
+        self.exc = exc
+
+
+class _CollectMatch:
+    """internal specifier implementing Match.validate / Match.collect"""
+
+    def __init__(self, match, max_failures):
+        self.match = match
+        self.max_failures = max_failures
+
+    def glomit(self, target, scope):
+        failures = []
+        sink = _FailureSink(failures, self.max_failures)
+        scope[MODE] = _glom_match
+        exc = None
+        try:
+            result = _collect(target, self.match.spec, scope, (), sink)
+        except MatchCollectError:
+            raise
+        except Exception as e:
+            # a non-match exception from user code must propagate untouched,
+            # not be wrapped or swallowed -- stash it for the entrypoint
+            exc = e
+            result = None
+        else:
+            if sink.failures:
+                raise MatchCollectError(sink.failures, sink.truncated)
+        return _CollectReport(result, sink.failures, sink.truncated, exc)
+
+
+class _FailureSink:
+    __slots__ = ('failures', 'max_failures', 'truncated')
+
+    def __init__(self, failures, max_failures):
+        self.failures = failures
+        self.max_failures = max_failures
+        self.truncated = False
+
+    def emit(self, path, error, branches=None):
+        if self.truncated:
+            return
+        message = getattr(error, 'get_message', None)
+        if callable(message):
+            message = message()
+        else:
+            message = str(error)
+        real_count = len([f for f in self.failures if f is not TRUNCATED])
+        if self.max_failures is not None and real_count >= self.max_failures:
+            self.truncated = True
+            if TRUNCATED not in self.failures:
+                self.failures.append(TRUNCATED)
+            return
+        self.failures.append(MatchFailure(path, message, error=error, branches=branches))
+        real_count += 1
+        if self.max_failures is not None and real_count >= self.max_failures:
+            self.truncated = True
+            self.failures.append(TRUNCATED)
+
+
+def _collect(target, spec, scope, path, sink):
+    """match-mode evaluator that records every failure on *sink* and
+    keeps computing defaults/conversions; returns the matched result.
+    Only MatchError (a GlomError) is a match signal -- other
+    exceptions propagate untouched.
+    """
+    if sink.truncated:
+        return None
+    if isinstance(spec, Or):
+        return _collect_or(target, spec, scope, path, sink)
+    if isinstance(spec, And):
+        return _collect_and(target, spec, scope, path, sink)
+    if type(spec) is Not:
+        return _collect_not(target, spec, scope, path, sink)
+    if _has_callable_glomit(spec):
+        try:
+            return scope[glom](target, spec, scope)
+        except GlomError as e:
+            sink.emit(path, e)
+            return None
+    if isinstance(spec, type):
+        if not isinstance(target, spec):
+            sink.emit(path, TypeMatchError(type(target), spec))
+            return None
+        return target
+    if isinstance(spec, dict):
+        return _collect_dict(target, spec, scope, path, sink)
+    if isinstance(spec, (list, set, frozenset)):
+        return _collect_sequence(target, spec, scope, path, sink)
+    if isinstance(spec, tuple):
+        if not isinstance(target, tuple):
+            sink.emit(path, TypeMatchError(type(target), tuple))
+            return None
+        if len(target) != len(spec):
+            sink.emit(path, MatchError("{0!r} does not match {1!r}", target, spec))
+            return None
+        result = []
+        for index, (sub_target, sub_spec) in enumerate(zip(target, spec)):
+            result.append(_collect(sub_target, sub_spec, scope, path + (index,), sink))
+        return tuple(result)
+    if callable(spec):
+        try:
+            if spec(target):
+                return target
+        except MatchError as e:
+            sink.emit(path, e)
+            return None
+        sink.emit(path, MatchError(
+            "{0}({1!r}) did not validate (non truthy return)",
+            spec.__name__, target))
+        return None
+    if target != spec:
+        sink.emit(path, MatchError("{0!r} does not match {1!r}", target, spec))
+        return None
+    return target
+
+
+def _collect_or(target, spec, scope, path, sink):
+    branch_failure_lists = []
+    for child in spec.children:
+        if sink.truncated:
+            return None
+        branch_failures = []
+        _collect(target, child, scope, path, _BranchSink(sink, branch_failures))
+        if not branch_failures:
+            return target
+        branch_failure_lists.append(branch_failures)
+    # every branch failed: with a default this is not a problem;
+    # otherwise it is one logical problem, attempts attached as detail
+    if spec.default is _MISSING and not sink.truncated:
+        sink.emit(
+            path,
+            MatchError("target {0!r} did not match any branch of {1!r}",
+                       target, spec),
+            branches=branch_failure_lists)
+    if spec.default is not _MISSING:
+        return arg_val(target, spec.default, scope)
+    return None
+
+
+class _BranchSink:
+    """provisional sink for a single Or/list-element attempt.
+
+    Failures are held back from the outer report so that a later
+    successful branch never leaks earlier attempts; if every attempt
+    fails the held failures stay attached as per-attempt detail rather
+    than becoming top-level user errors.
+    """
+    __slots__ = ('failures', 'truncated')
+
+    def __init__(self, outer, failures):
+        self.failures = failures
+        self.truncated = False
+
+    def emit(self, path, error, branches=None):
+        message = getattr(error, 'get_message', None)
+        message = message() if callable(message) else str(error)
+        self.failures.append(MatchFailure(path, message, error=error, branches=branches))
+
+
+def _collect_and(target, spec, scope, path, sink):
+    if spec.default is not _MISSING:
+        # normal Bool.glomit swallows the whole failure when a default
+        # exists, so keep attempts out of the outer report
+        local_failures = []
+        local_sink = _BranchSink(sink, local_failures)
+        result = target
+        for child in spec.children:
+            result = _collect(target, child, scope, path, local_sink)
+            if local_sink.failures:
+                return arg_val(target, spec.default, scope)
+        return result
+    result = target
+    for child in spec.children:
+        if sink.truncated:
+            return _and_default(target, spec)
+        before = len(sink.failures)
+        result = _collect(target, child, scope, path, sink)
+        if len(sink.failures) != before or sink.truncated:
+            return _and_default(target, spec) if spec.default is not _MISSING else result
+    return result
+
+
+def _and_default(target, spec):
+    return arg_val(target, spec.default, scope) if spec.default is not _MISSING else None
+
+
+def _collect_not(target, spec, scope, path, sink):
+    branch_failures = []
+    _collect(target, spec.child, scope, path, _BranchSink(sink, branch_failures))
+    if branch_failures:
+        return target
+    sink.emit(path, MatchError("child shouldn't have passed: {0!r}", spec.child))
+    return None
+
+
+def _collect_dict(target, spec, scope, path, sink):
+    if not isinstance(target, dict):
+        sink.emit(path, TypeMatchError(type(target), dict))
+        return None
+    spec_keys = list(spec.keys())
+    required = set()
+    for spec_key in spec_keys:
+        if type(spec_key) is Required or (
+                type(spec_key) is not Optional and _precedence(spec_key) == 0):
+            required.add(spec_key)
+    defaults = {
+        spec_key.key: spec_key.default for spec_key in spec_keys
+        if type(spec_key) is Optional and spec_key.default is not _MISSING}
+    result = {}
+    for target_key, value in target.items():
+        current_key = target_key
+        for maybe_spec_key in spec_keys:
+            spec_key = maybe_spec_key.key if type(maybe_spec_key) is Required else maybe_spec_key
+            try:
+                current_key = scope[glom](target_key, spec_key, scope)
+            except GlomError:
+                continue
+            result[current_key] = _collect(
+                value, spec[maybe_spec_key], scope, path + (current_key,), sink)
+            required.discard(maybe_spec_key)
+            break
+        else:
+            sink.emit(
+                path,
+                MatchError("key {0!r} didn't match any of {1!r}", target_key, spec_keys))
+    for default_key in set(defaults) - set(result):
+        result[default_key] = arg_val(target, defaults[default_key], scope)
+    for missing_key in sorted(required, key=lambda k: bbrepr(k)):
+        if sink.truncated:
+            break
+        label_key = missing_key.key if type(missing_key) is Required else missing_key
+        missing_path = path if type(missing_key) is Required else path + (label_key,)
+        sink.emit(
+            missing_path,
+            MatchError("target missing expected key: {0}", bbrepr(label_key)))
+    return result
+
+
+def _collect_sequence(target, spec, scope, path, sink):
+    if not isinstance(target, type(spec)):
+        sink.emit(path, TypeMatchError(type(target), type(spec)))
+        return None
+    children = tuple(spec)
+    result = []
+    for index, item in enumerate(target):
+        item_path = path + (index,)
+        if not children:
+            sink.emit(
+                item_path,
+                MatchError("{0!r} does not match empty {1}", target, type(spec).__name__))
+            continue
+        if len(children) == 1:
+            result.append(_collect(item, children[0], scope, item_path, sink))
+            continue
+        branch_failure_lists = []
+        for child in children:
+            if sink.truncated:
+                break
+            branch_failures = []
+            child_result = _collect(
+                item, child, scope, item_path, _BranchSink(sink, branch_failures))
+            if not branch_failures:
+                result.append(child_result)
+                break
+            branch_failure_lists.append(branch_failures)
+        else:
+            # every branch failed for this element: one logical failure
+            if not sink.truncated:
+                sink.emit(
+                    item_path,
+                    MatchError("{0!r} does not match any of {1!r}", item, spec),
+                    branches=branch_failure_lists)
+    if type(spec) is list:
+        return result
+    return type(spec)(result)
