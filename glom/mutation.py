@@ -213,6 +213,187 @@ def assign(obj, path, val, missing=None):
     return glom(obj, Assign(path, val, missing=missing))
 
 
+class Update:
+    """*New in glom 25.12.1*
+
+    The ``Update`` specifier type performs a "deep update", modifying
+    each value found at *path* based on its own old value. Where
+    :class:`~glom.Assign` writes a single value computed once from the
+    whole target, ``Update`` evaluates its *val* spec once per matched
+    location, with the old value at that location as the input::
+
+      # apply a discount to every price, each computed from its own old value
+      >>> target = {'orders': [{'price': 100}, {'price': 40}]}
+      >>> _ = glom(target, Update('orders.*.price', T * 0.9))
+      >>> pprint(target)
+      {'orders': [{'price': 90.0}, {'price': 36.0}]}
+
+    Within the *val* spec, ``T`` refers to the old value at the
+    current location. The original target is available through the
+    explicit ``'target'`` scope entry, and parameters passed to the
+    call (e.g. ``glom(target, spec, scope={'discount': 0.9})``) are
+    available through :data:`~glom.S` as usual::
+
+      >>> target = {'tax_rate': 0.2, 'orders': [{'price': 100}, {'price': 50}]}
+      >>> spec = Update('orders.*.price', T * (S['target']['tax_rate'] + 1) * S['discount'])
+      >>> _ = glom(target, spec, scope={'discount': 0.5})
+      >>> pprint(target)
+      {'orders': [{'price': 60.0}, {'price': 30.0}], 'tax_rate': 0.2}
+
+    When a wildcard (``*``/``**``) path matches the same physical
+    location more than once (e.g. a shared subobject reachable along
+    several routes), the location is only updated once, in order of
+    first discovery::
+
+      >>> shared = {'price': 10}
+      >>> target = {'a': shared, 'b': shared}
+      >>> _ = glom(target, Update('*.price', T + 1))
+      >>> shared
+      {'price': 11}
+
+    Whether missing paths are created is explicitly chosen by the
+    caller through the *missing* argument, which works just like
+    :class:`~glom.Assign`'s. When *missing* is set and a location does
+    not exist yet, the *val* spec is evaluated with ``None`` as the
+    old value::
+
+      >>> target = {}
+      >>> _ = glom(target, Update('a.b', (T, lambda v: (v or 0) + 1), missing=dict))
+      >>> pprint(target)
+      {'a': {'b': 1}}
+
+    Without *missing*, updating a path that does not exist raises
+    :class:`~glom.PathAccessError`.
+
+    ``Update`` is not atomic: locations are updated one at a time, in
+    order of discovery, and if evaluating *val* or writing a result
+    fails, updates already applied to earlier locations are retained
+    (not rolled back). Failures keep glom's usual path diagnostics:
+    a failed read raises :class:`~glom.PathAccessError`, a failed
+    *val* evaluation propagates its original error, and a failed
+    write raises :class:`~glom.PathAssignError`.
+
+    Like :class:`~glom.Assign`, ``Update`` supports assigning to
+    attributes of objects, keys of mappings, and indexes of sequences
+    out of the box. Additional types can be registered through
+    :func:`~glom.register()` using the ``"assign"`` operation name
+    (and ``"get"`` for reading the old value).
+
+    """
+    def __init__(self, path, val, missing=None):
+        if isinstance(path, basestring):
+            path = Path.from_text(path)
+        elif type(path) is TType:
+            path = Path(path)
+        elif not isinstance(path, Path):
+            raise TypeError('path argument must be a .-delimited string, Path, T, or S')
+
+        try:
+            self.op, self.arg = path.items()[-1]
+        except IndexError:
+            raise ValueError('path must have at least one element')
+        self._orig_path = path
+        self.path = path[:-1]
+
+        if self.op not in '[.P':
+            raise ValueError('last part of path must be setattr or setitem')
+        self.val = val
+
+        if missing is not None:
+            if not callable(missing):
+                raise TypeError(f'expected missing to be callable, not {missing!r}')
+        self.missing = missing
+        self._bind_target = True
+
+    def _get_old_val(self, dest, op, arg, scope):
+        if op == '[':
+            return dest[arg]
+        elif op == '.':
+            return getattr(dest, arg)
+        # op == 'P'
+        get = scope[TargetRegistry].get_handler('get', dest)
+        return get(dest, arg)
+
+    def _update_one(self, dest, op, arg, path, seen, scope):
+        if id(dest) in seen:
+            return
+        seen.add(id(dest))
+        try:
+            old_val = self._get_old_val(dest, op, arg, scope)
+        except GlomError:
+            raise
+        except Exception as e:
+            if not self.missing:
+                raise PathAccessError(e, self._orig_path, len(self._orig_path.items()) - 1)
+            old_val = None
+        new_val = scope[glom](old_val, self.val, scope)
+        _assign_op(dest=dest, op=op, arg=arg, val=new_val, path=path, scope=scope)
+
+    def glomit(self, target, scope):
+        if self._bind_target:
+            scope.update({'target': target})
+
+        op, arg, path = self.op, self.arg, self.path
+        if self.path.startswith(S):
+            dest_target = scope[UP]
+            dest_path = self.path.from_t()
+        else:
+            dest_target = target
+            dest_path = self.path
+        try:
+            dest = scope[glom](dest_target, dest_path, scope)
+        except PathAccessError as pae:
+            if not self.missing:
+                raise
+
+            remaining_path = self._orig_path[pae.part_idx + 1:]
+            sub_update = Update(remaining_path, self.val, missing=self.missing)
+            sub_update._bind_target = False  # keep the original target binding
+            val = scope[glom](self.missing(), sub_update, scope)
+
+            op, arg = self._orig_path.items()[pae.part_idx]
+            path = self._orig_path[:pae.part_idx]
+            dest = scope[glom](dest_target, path, scope)
+
+            # the backfilled subtree is already fully computed, assign
+            # it directly, just like Assign
+            _apply = lambda dest: _assign_op(
+                dest=dest, op=op, arg=arg, val=val, path=path, scope=scope)
+            _apply_for_each(_apply, path, dest)
+
+            return target
+
+        seen = set()
+        _apply_for_each(lambda dest: self._update_one(dest, op, arg, path, seen, scope),
+                        path, dest)
+
+        return target
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        if self.missing is None:
+            return f'{cn}({self._orig_path!r}, {self.val!r})'
+        return f'{cn}({self._orig_path!r}, {self.val!r}, missing={bbrepr(self.missing)})'
+
+
+def update(obj, path, val, missing=None):
+    """*New in glom 25.12.1*
+
+    The ``update()`` function provides convenient "deep update"
+    functionality, modifying each value found at *path* based on its
+    own old value::
+
+      >>> target = {'orders': [{'price': 100}, {'price': 40}]}
+      >>> _ = update(target, 'orders.*.price', lambda price: price * 0.9)
+      >>> pprint(target)
+      {'orders': [{'price': 90.0}, {'price': 36.0}]}
+
+    For more information and examples, see the :class:`~glom.Update`
+    specifier type, which this function wraps.
+    """
+    return glom(obj, Update(path, val, missing=missing))
+
+
 _ALL_BUILTIN_TYPES = [v for v in __builtins__.values() if isinstance(v, type)]
 _BUILTIN_BASE_TYPES = [v for v in _ALL_BUILTIN_TYPES
                        if not issubclass(v, tuple([t for t in _ALL_BUILTIN_TYPES

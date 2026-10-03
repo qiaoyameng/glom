@@ -12,6 +12,18 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## 25.12.1
+
+_(in development)_
+
+- Add the ``Update`` specifier type and ``update()`` convenience
+  function, performing per-leaf deep updates: each value found at a
+  path is recomputed from its own old value (``T``), with the original
+  target and call parameters reachable through ``S['target']`` and
+  other scope entries. Wildcard matches to the same physical location
+  are only updated once, and missing-path creation remains an explicit
+  opt-in via ``missing``.
+
 ## 25.12.0
 
 _(December 28, 2025)_

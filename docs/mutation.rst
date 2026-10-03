@@ -15,6 +15,16 @@ Deeply assign within an existing structure, given a path and a value.
 
 .. autoclass:: glom.Assign
 
+Updating
+--------
+
+Deeply update each value found at a path, computing every new value
+from its own old value.
+
+.. autofunction:: glom.update
+
+.. autoclass:: glom.Update
+
 Deletion
 --------
 
