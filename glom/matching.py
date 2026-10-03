@@ -9,6 +9,7 @@ step, you can do these checks inline with your glom spec, using
 
 import re
 import sys
+from contextlib import contextmanager
 from pprint import pprint
 
 from boltons.iterutils import is_iterable
@@ -18,6 +19,151 @@ from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation,
 
 
 _MISSING = make_sentinel('_MISSING')
+_MATCH_COLLECTOR = make_sentinel('_MATCH_COLLECTOR')
+
+
+class MatchFailure(dict):
+    """A single structured Match failure.
+
+    ``path`` is the original target path, represented as a tuple. An
+    empty tuple means the failure occurred at the root.
+    """
+    def __init__(self, path, message, error):
+        super().__init__(path=tuple(path), message=message, error=error)
+        self.path = tuple(path)
+        self.message = message
+        self.error = error
+
+    def __repr__(self):
+        return 'MatchFailure(path={0!r}, message={1!r})'.format(
+            self.path, self.message)
+
+
+class MatchResult(dict):
+    """The result of explicit Match error collection.
+
+    A failed result never exposes a partially constructed value; use
+    ``value`` only when ``ok`` is true.
+    """
+    def __init__(self, value, errors, omitted_count=0):
+        ok = not errors and omitted_count == 0
+        super().__init__(ok=ok, value=value if ok else None,
+                         errors=list(errors),
+                         truncated=omitted_count > 0,
+                         omitted_count=omitted_count)
+        self.ok = ok
+        self.value = value if ok else None
+        self.errors = list(errors)
+        self.truncated = omitted_count > 0
+        self.omitted_count = omitted_count
+
+    @property
+    def valid(self):
+        return self.ok
+
+    @property
+    def success(self):
+        return self.ok
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        return ('MatchResult(ok={0!r}, value={1!r}, errors={2!r}, '
+                'truncated={3!r}, omitted_count={4!r})').format(
+                    self.ok, self.value, self.errors, self.truncated,
+                    self.omitted_count)
+
+
+class _MatchCollector:
+    __slots__ = ('path', 'errors', 'omitted_count', 'max_errors')
+
+    def __init__(self, max_errors=None):
+        self.path = ()
+        self.errors = []
+        self.omitted_count = 0
+        self.max_errors = max_errors
+
+    def snapshot(self):
+        return len(self.errors), self.omitted_count
+
+    def rollback(self, snapshot):
+        error_count, omitted_count = snapshot
+        del self.errors[error_count:]
+        self.omitted_count = omitted_count
+
+    @contextmanager
+    def at(self, path_part):
+        self.path += (path_part,)
+        try:
+            yield
+        finally:
+            self.path = self.path[:-1]
+
+    def record(self, error):
+        path = self.path
+        if isinstance(error, _CollectedMatchError):
+            child_failure = error.failure
+            if child_failure is not None and child_failure.path:
+                path = path + child_failure.path
+            underlying = child_failure.error if child_failure is not None else error
+        else:
+            child_failure = None
+            underlying = error
+        message = underlying.get_message() if isinstance(underlying, GlomError) else str(underlying)
+        failure = MatchFailure(path, message, underlying)
+        self.append_failure(failure)
+        raise _CollectedMatchError(failure)
+
+    def append_failure(self, failure):
+        if self.max_errors is None or len(self.errors) < self.max_errors:
+            self.errors.append(failure)
+        else:
+            self.omitted_count += 1
+
+    def logical(self, error, snapshot):
+        self.rollback(snapshot)
+        self.record(error)
+
+    def raise_if_errors(self):
+        if self.errors or self.omitted_count:
+            raise _CollectedMatchError(self.errors[-1] if self.errors else None)
+
+
+def _get_collector(scope):
+    collector = scope.get(_MATCH_COLLECTOR)
+    return collector if isinstance(collector, _MatchCollector) else None
+
+
+def _match_error(error):
+    return error.failure.error if isinstance(error, _CollectedMatchError) else error
+
+
+class _MatchCollection:
+    __slots__ = ('spec', 'max_errors', 'default')
+
+    def __init__(self, spec, max_errors, default=_MISSING):
+        self.spec = spec
+        self.max_errors = max_errors
+        self.default = default
+
+    def glomit(self, target, scope):
+        collector = _MatchCollector(self.max_errors)
+        scope[_MATCH_COLLECTOR] = collector
+        scope[MODE] = _glom_match
+        value = None
+        try:
+            value = scope[glom](target, self.spec, scope)
+        except _CollectedMatchError:
+            if self.default is _MISSING:
+                pass
+            else:
+                collector.errors.clear()
+                collector.omitted_count = 0
+                value = arg_val(target, self.default, scope)
+        except Exception:
+            raise
+        return MatchResult(value, collector.errors, collector.omitted_count)
 
 
 # NOTE: it is important that MatchErrors be cheap to construct,
@@ -67,6 +213,13 @@ class TypeMatchError(MatchError, TypeError):
         # __init__ args = (actual, expected)
         # self.args = (fmt_str, expected, actual)
         return TypeMatchError(self.args[2], self.args[1])
+
+
+class _CollectedMatchError(MatchError):
+    def __init__(self, failure):
+        self.failure = failure
+        super().__init__("{0}: {1}", getattr(failure, 'path', ()),
+                         getattr(failure, 'message', ''))
 
 
 class Match:
@@ -146,14 +299,36 @@ class Match:
         self.default = default
 
     def glomit(self, target, scope):
+        collector = _get_collector(scope)
+        snapshot = collector.snapshot() if collector is not None else None
         scope[MODE] = _glom_match
         try:
             ret = scope[glom](target, self.spec, scope)
         except GlomError:
             if self.default is _MISSING:
                 raise
+            if collector is not None:
+                collector.rollback(snapshot)
             ret = arg_val(target, self.default, scope)
         return ret
+
+    def collect(self, target, max_errors=None):
+        """Validate *target*, collecting structured failures instead of raising.
+
+        Args:
+          target: Target value or data structure to validate.
+          max_errors: Optional maximum number of retained failures.
+        """
+        if max_errors is not None and (not isinstance(max_errors, int)
+                                       or isinstance(max_errors, bool)
+                                       or max_errors < 1):
+            raise ValueError('max_errors must be a positive integer or None')
+        return glom(target,
+                    _MatchCollection(self.spec, max_errors, self.default),
+                    glom_debug=True)
+
+    def collect_errors(self, target, max_errors=None):
+        return self.collect(target, max_errors=max_errors).errors
 
     def verify(self, target):
         """A convenience function a :class:`Match` instance which returns the
@@ -280,10 +455,14 @@ class _Bool:
         return Not(self)
 
     def glomit(self, target, scope):
+        collector = _get_collector(scope)
+        snapshot = collector.snapshot() if collector is not None else None
         try:
             return self._glomit(target, scope)
         except GlomError:
             if self.default is not _MISSING:
+                if collector is not None:
+                    collector.rollback(snapshot)
                 return arg_val(target, self.default, scope)
             raise
 
@@ -315,9 +494,20 @@ class And(_Bool):
 
     def _glomit(self, target, scope):
         # all children must match without exception
+        collector = _get_collector(scope)
         result = target  # so that And() == True, similar to all([]) == True
         for child in self.children:
-            result = scope[glom](target, child, scope)
+            try:
+                result = scope[glom](target, child, scope)
+            except GlomError as error:
+                if collector is None:
+                    raise
+                if not isinstance(error, MatchError):
+                    raise
+                if not isinstance(error, _CollectedMatchError):
+                    collector.record(error)
+        if collector is not None:
+            collector.raise_if_errors()
         return result
 
     def __and__(self, other):
@@ -335,12 +525,39 @@ class Or(_Bool):
     __slots__ = ('children',)
 
     def _glomit(self, target, scope):
-        for child in self.children[:-1]:
-            try:  # one child must match without exception
-                return scope[glom](target, child, scope)
-            except GlomError:
-                pass
-        return scope[glom](target, self.children[-1], scope)
+        collector = _get_collector(scope)
+        if collector is None:
+            for child in self.children[:-1]:
+                try:  # one child must match without exception
+                    return scope[glom](target, child, scope)
+                except GlomError:
+                    pass
+            return scope[glom](target, self.children[-1], scope)
+
+        start = collector.snapshot()
+        causes = []
+        last_error = None
+        for child in self.children:
+            attempt = collector.snapshot()
+            try:
+                result = scope[glom](target, child, scope)
+            except MatchError as error:
+                if not isinstance(error, _CollectedMatchError):
+                    try:
+                        collector.record(error)
+                    except _CollectedMatchError as recorded:
+                        error = recorded
+                causes.extend(failure.error for failure in
+                              collector.errors[attempt[0]:])
+                last_error = _match_error(error)
+                continue
+            collector.rollback(start)
+            return result
+        logical = MatchError(
+            "no branches matched in {0!r}; {1} attempt(s) failed",
+            self, len(self.children))
+        logical.causes = tuple(causes) or (last_error,)
+        collector.logical(logical, start)
 
     def __or__(self, other):
         # reduce number of layers of spec
@@ -361,9 +578,13 @@ class Not(_Bool):
         self.child = child
 
     def glomit(self, target, scope):
+        collector = _get_collector(scope)
+        snapshot = collector.snapshot() if collector is not None else None
         try:  # one child must match without exception
             scope[glom](target, self.child, scope)
         except GlomError:
+            if collector is not None:
+                collector.rollback(snapshot)
             return target
         else:
             raise GlomError("child shouldn't have passed", self.child)
@@ -676,88 +897,210 @@ def _precedence(match):
 
 def _handle_dict(target, spec, scope):
     if not isinstance(target, dict):
-        raise TypeMatchError(type(target), dict)
+        error = TypeMatchError(type(target), dict)
+        collector = _get_collector(scope)
+        if collector is not None:
+            collector.record(error)
+        raise error
+    collector = _get_collector(scope)
     spec_keys = spec  # cheating a little bit here, list-vs-dict, but saves an object copy sometimes
 
     required = {
         key for key in spec_keys
-        if _precedence(key) == 0 and type(key) is not Optional
-        or type(key) is Required}
+        if type(key) is Required or
+        (_precedence(key) == 0 and type(key) is not Optional)}
     defaults = {  # pre-load result with defaults
         key.key: key.default for key in spec_keys
         if type(key) is Optional and key.default is not _MISSING}
     result = {}
-    for key, val in target.items():
+    for target_key, val in target.items():
         for maybe_spec_key in spec_keys:
             # handle Required as a special case here rather than letting it be a stand-alone spec
             if type(maybe_spec_key) is Required:
                 spec_key = maybe_spec_key.key
             else:
                 spec_key = maybe_spec_key
+            key_attempt = collector.snapshot() if collector is not None else None
             try:
-                key = scope[glom](key, spec_key, scope)
-            except GlomError:
-                pass
+                matched_key = scope[glom](target_key, spec_key, scope)
+            except GlomError as error:
+                if collector is not None:
+                    collector.rollback(key_attempt)
+                    if not isinstance(error, MatchError):
+                        raise
+                    continue
+                continue
+
+            required.discard(maybe_spec_key)
+            try:
+                if collector is not None:
+                    with collector.at(target_key):
+                        matched_val = scope[glom](
+                            val, spec[maybe_spec_key], chain_child(scope))
+                else:
+                    matched_val = scope[glom](
+                        val, spec[maybe_spec_key], chain_child(scope))
+            except GlomError as error:
+                if collector is not None:
+                    if not isinstance(error, MatchError):
+                        raise
+                    break
+                raise
             else:
-                result[key] = scope[glom](val, spec[maybe_spec_key], chain_child(scope))
-                required.discard(maybe_spec_key)
+                result[matched_key] = matched_val
                 break
         else:
-            raise MatchError("key {0!r} didn't match any of {1!r}", key, spec_keys)
+            error = MatchError(
+                "key {0!r} didn't match any of {1!r}", target_key, spec_keys)
+            if collector is not None:
+                with collector.at(target_key):
+                    collector.record(error)
+            else:
+                raise error
     for key in set(defaults) - set(result):
         result[key] = arg_val(target, defaults[key], scope)
     if required:
-        raise MatchError("target missing expected keys: {0}", ', '.join([bbrepr(r) for r in required]))
+        missing = [key for key in spec_keys if key in required]
+        error = MatchError(
+            "target missing expected keys: {0}",
+            ', '.join([bbrepr(r) for r in missing]))
+        if collector is not None:
+            for key in missing:
+                expected = key.key if type(key) is Required else key
+                with collector.at(expected):
+                    collector.record(error)
+        else:
+            raise error
     return result
 
 
 def _glom_match(target, spec, scope):
+    collector = _get_collector(scope)
     if isinstance(spec, type):
         if not isinstance(target, spec):
-            raise TypeMatchError(type(target), spec)
+            error = TypeMatchError(type(target), spec)
+            if collector is not None:
+                collector.record(error)
+            raise error
     elif isinstance(spec, dict):
         return _handle_dict(target, spec, scope)
     elif isinstance(spec, (list, set, frozenset)):
-        if not isinstance(target, type(spec)):
-            raise TypeMatchError(type(target), type(spec))
+        expected_type = type(spec)
+        if not isinstance(target, expected_type) or (
+                expected_type is set and isinstance(target, dict)):
+            error = TypeMatchError(type(target), expected_type)
+            if collector is not None:
+                collector.record(error)
+            raise error
         result = []
-        for item in target:
-            for child in spec:
-                try:
-                    result.append(scope[glom](item, child, scope))
+        for index, item in enumerate(target):
+            item_snapshot = collector.snapshot() if collector is not None else None
+            last_error = None
+            item_matched = False
+            if collector is not None and type(spec) is list:
+                path_context = collector.at(index)
+                path_context.__enter__()
+            else:
+                path_context = None
+            try:
+                for child in spec:
+                    child_snapshot = (collector.snapshot()
+                                      if collector is not None else None)
+                    try:
+                        matched = scope[glom](item, child, scope)
+                    except GlomError as error:
+                        if collector is not None and not isinstance(error, MatchError):
+                            raise
+                        last_error = _match_error(error)
+                        if collector is not None:
+                            collector.rollback(child_snapshot)
+                        continue
+                    if collector is not None:
+                        collector.rollback(child_snapshot)
+                    result.append(matched)
+                    item_matched = True
                     break
-                except GlomError as e:
-                    last_error = e
-            else:  # did not break, something went wrong
+            finally:
+                if path_context is not None:
+                    path_context.__exit__(None, None, None)
+            if item_matched:
+                continue
+            if collector is None:
                 if target and not spec:
                     raise MatchError(
-                        "{0!r} does not match empty {1}", target, type(spec).__name__)
-                # NOTE: unless error happens above, break will skip else branch
-                # so last_error will have been assigned
+                        "{0!r} does not match empty {1}", target,
+                        type(spec).__name__)
                 raise last_error
+
+            collector.rollback(item_snapshot)
+            if target and not spec:
+                logical = MatchError(
+                    "{0!r} does not match empty {1}", target,
+                    type(spec).__name__)
+            elif len(spec) > 1:
+                logical = MatchError(
+                    "{0!r} does not match any pattern in {1}", item, spec)
+                logical.causes = ((last_error,)
+                                  if last_error is not None else ())
+            else:
+                logical = last_error
+
+            failure_path = collector.path
+            if type(spec) is list:
+                failure_path += (index,)
+            collector.append_failure(MatchFailure(
+                failure_path, logical.get_message(), logical))
+        if collector is not None:
+            collector.raise_if_errors()
         if type(spec) is not list:
             return type(spec)(result)
         return result
     elif isinstance(spec, tuple):
         if not isinstance(target, tuple):
-            raise TypeMatchError(type(target), tuple)
+            error = TypeMatchError(type(target), tuple)
+            if collector is not None:
+                collector.record(error)
+            raise error
         if len(target) != len(spec):
-            raise MatchError("{0!r} does not match {1!r}", target, spec)
+            error = MatchError("{0!r} does not match {1!r}", target, spec)
+            if collector is not None:
+                collector.record(error)
+            else:
+                raise error
         result = []
-        for sub_target, sub_spec in zip(target, spec):
-            result.append(scope[glom](sub_target, sub_spec, scope))
+        for index, (sub_target, sub_spec) in enumerate(zip(target, spec)):
+            try:
+                if collector is not None:
+                    with collector.at(index):
+                        result.append(scope[glom](sub_target, sub_spec, scope))
+                else:
+                    result.append(scope[glom](sub_target, sub_spec, scope))
+            except GlomError as error:
+                if collector is None or not isinstance(error, _CollectedMatchError):
+                    raise
+        if collector is not None:
+            collector.raise_if_errors()
         return tuple(result)
     elif callable(spec):
         try:
             if spec(target):
                 return target
-        except Exception as e:
+        except Exception as error:
+            if collector is not None:
+                raise
             raise MatchError(
-                "{0}({1!r}) did not validate (got exception {2!r})", spec.__name__, target, e)
-        raise MatchError(
+                "{0}({1!r}) did not validate (got exception {2!r})",
+                spec.__name__, target, error)
+        error = MatchError(
             "{0}({1!r}) did not validate (non truthy return)", spec.__name__, target)
+        if collector is not None:
+            collector.record(error)
+        raise error
     elif target != spec:
-        raise MatchError("{0!r} does not match {1!r}", target, spec)
+        error = MatchError("{0!r} does not match {1!r}", target, spec)
+        if collector is not None:
+            collector.record(error)
+        raise error
     return target
 
 
@@ -846,15 +1189,34 @@ class Switch:
 
 
     def glomit(self, target, scope):
+        collector = _get_collector(scope)
+        start = collector.snapshot() if collector is not None else None
+        causes = []
         for keyspec, valspec in self.cases:
+            attempt = collector.snapshot() if collector is not None else None
             try:
                 scope[glom](target, keyspec, scope)
             except GlomError as ge:
+                if collector is not None:
+                    if not isinstance(ge, MatchError):
+                        raise
+                    branch_failures = collector.errors[attempt[0]:]
+                    causes.extend(failure.error for failure in branch_failures)
+                    if not branch_failures:
+                        causes.append(ge)
                 continue
+            if collector is not None:
+                collector.rollback(start)
             return scope[glom](target, valspec, chain_child(scope))
         if self.default is not _MISSING:
+            if collector is not None:
+                collector.rollback(start)
             return arg_val(target, self.default, scope)
-        raise MatchError("no matches for target in %s"  % self.__class__.__name__)
+        error = MatchError("no matches for target in %s"  % self.__class__.__name__)
+        if collector is not None:
+            error.causes = tuple(causes)
+            collector.logical(error, start)
+        raise error
 
     def __repr__(self):
         return f'{self.__class__.__name__}({bbrepr(self.cases)})'

@@ -14,6 +14,26 @@ For matching whole data structures, use a :class:`~glom.Match` spec.
 .. autoclass:: glom.Match
    :members:
 
+Collecting validation failures
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use :meth:`~glom.Match.collect` when an API client should be able to
+fix several issues in one submission instead of receiving one exception
+at a time. The method returns a :class:`~glom.MatchResult`. Successful
+results expose the same transformed value as ordinary matching; failed
+results have ``value=None`` and a structured list of
+:class:`~glom.MatchFailure` objects.
+
+Each failure contains its original target path in ``path``, a
+human-readable ``message``, and the underlying matching exception in
+``error``. When all branches of an :class:`~glom.Or` fail, the branch is
+reported as one logical failure and the branch-level causes are retained
+on that error.
+
+.. autoclass:: glom.MatchResult
+
+.. autoclass:: glom.MatchFailure
+
 Optional and required ``dict`` key matching
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

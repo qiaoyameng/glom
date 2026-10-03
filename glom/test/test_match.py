@@ -508,3 +508,88 @@ def test_switch():
 
 def test_nested_dict():
     assert glom({1: 2}, Match({A.t: S.t})) == {1: 1}
+
+
+def test_match_collect_structured_failures():
+    spec = Match({
+        'name': str,
+        'tags': [str],
+        'kind': Or(int, str),
+    })
+    target = {'tags': ['ok', 3, False], 'kind': None}
+
+    result = spec.collect(target)
+
+    assert not result.ok
+    assert result.value is None
+    actual_failures = [
+        (failure.path, failure.message) for failure in result.errors
+    ]
+    assert actual_failures[:2] == [
+        (('tags', 1), 'expected type str, not int'),
+        (('tags', 2), 'expected type str, not bool'),
+    ]
+    assert actual_failures[2][0] == ('kind',)
+    assert actual_failures[3] == (
+        ('name',), "target missing expected keys: 'name'")
+    assert 'no branches matched in Or(int, str)' in result.errors[2].message
+    assert len(result.errors[2].error.causes) == 2
+    assert result.errors[3].message == "target missing expected keys: 'name'"
+
+
+def test_match_collect_success_transforms_and_defaults():
+    spec = Match({
+        'name': str,
+        Optional('count', default=1): int,
+        'values': [Auto(str)],
+    })
+
+    result = spec.collect({'name': 'ok', 'values': [1, 2]})
+
+    assert result.ok
+    assert result.value == {'name': 'ok', 'count': 1,
+                            'values': ['1', '2']}
+
+    defaulted = Match(str, default='default').collect(1)
+    assert defaulted.ok
+    assert defaulted.value == 'default'
+    assert defaulted.errors == []
+
+
+def test_match_collect_truncation_and_non_match_errors():
+    result = Match([int]).collect([1, 'two', 'three'], max_errors=1)
+
+    assert not result.ok
+    assert result.value is None
+    assert len(result.errors) == 1
+    assert result.errors[0].path == (1,)
+    assert result.truncated
+    assert result.omitted_count == 1
+
+    with pytest.raises(ValueError):
+        Match(int).collect({}, max_errors=0)
+
+    def boom(target):
+        raise RuntimeError('boom')
+
+    with pytest.raises(RuntimeError, match='boom'):
+        Match(boom).collect(1)
+
+
+def test_match_collect_tuple_and_branch_causes():
+    result = Match((str, int)).collect((1, 'x'))
+
+    assert not result.ok
+    assert [failure.path for failure in result.errors] == [(0,), (1,)]
+
+    result = Match([Or(str, int)]).collect([None])
+    assert not result.ok
+    assert result.errors[0].path == (0,)
+    assert len(result.errors[0].error.causes) == 2
+
+
+def test_match_collect_raises_remain_compatible():
+    with pytest.raises(TypeMatchError):
+        glom('x', Match(int))
+
+    assert Match(int).matches(1)
