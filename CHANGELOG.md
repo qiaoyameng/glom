@@ -12,6 +12,10 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Added ``glom.projection`` with explicit, round-trippable ``Field`` and ``Project`` specs for projecting a target into an editable form and writing edits back. Fields declare a source path and optional forward/reverse transforms; one-way transforms and lossy defaults are never assumed invertible, and shared-source fields must agree or the whole write fails atomically.
+
 ## 25.12.0
 
 _(December 28, 2025)_

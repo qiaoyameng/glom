@@ -47,5 +47,7 @@ from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 # generation, production, iteration, all have more relevant meanings
 # elsewhere. (maybe procrastination :P)
 from glom.streaming import Iter
+from glom.projection import (Field, Project, ProjectionError,
+                             load as project_load, dump as project_dump)
 
 from glom._version import __version__

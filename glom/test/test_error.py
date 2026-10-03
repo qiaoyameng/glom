@@ -513,6 +513,18 @@ def test_all_public_errors():
         assert bbrepr(target)[:80] in exc_str
         assert bbrepr(spec)[:80] in exc_str
 
+    # ProjectionError is raised by write-back (Project.dump), not by a
+    # forward glom() call, so exercise it directly against the same
+    # standards as the errors above.
+    import glom
+    from glom.projection import Project, Field
+    proj_target = {'a': 1}
+    proj_spec = Project({'p1': Field('a', get=lambda v: v),
+                         'p2': Field('a', get=lambda v: v)})
+    with pytest.raises(glom.ProjectionError) as exc_info:
+        proj_spec.dump({'p1': 'x', 'p2': 'y'}, proj_target)
+    results.append((proj_target, proj_spec, exc_info.value))
+
     tested_types = [type(exc) for _, _, exc in results]
     untested_types = set(err_types) - set(tested_types)
 
