@@ -51,6 +51,7 @@ types that can be used with the basic set of Python builtins.
 .. autoclass:: glom.Path
 .. autoclass:: glom.Val
 .. autoclass:: glom.Spec
+.. autoclass:: glom.Project
 
 .. _advanced-specifiers:
 

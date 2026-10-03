@@ -1998,6 +1998,7 @@ class TargetRegistry:
         self._op_type_map = {}
         self._op_type_tree = {}  # see _register_fuzzy_type for details
         self._type_cache = {}
+        self._pure_type_ops = {}
 
         self._op_auto_map = OrderedDict()  # op name to function that returns handler function
 
@@ -2054,13 +2055,20 @@ class TargetRegistry:
     def _register_default_types(self):
         self.register(object)
         self.register(dict, get=operator.getitem)
+        self._pure_type_ops[dict] = {'get', 'item'}
         self.register(dict, keys=dict.keys)
         self.register(list, get=_get_sequence_item)
+        self._pure_type_ops[list] = {'get', 'item'}
         self.register(tuple, get=_get_sequence_item)
+        self._pure_type_ops[tuple] = {'get', 'item'}
         self.register(OrderedDict, get=operator.getitem)
+        self._pure_type_ops[OrderedDict] = {'get', 'item'}
         self.register(OrderedDict, keys=OrderedDict.keys)
         self.register(_AbstractIterable, iterate=iter)
         self.register(_ObjStyleKeys, keys=_ObjStyleKeys.get_keys)
+
+    def is_pure(self, obj, op_name):
+        return op_name in self._pure_type_ops.get(type(obj), ())
 
     def _register_fuzzy_type(self, op, new_type, _type_tree=None):
         """Build a "type tree", an OrderedDict mapping registered types to
@@ -2098,6 +2106,7 @@ class TargetRegistry:
         if not isinstance(target_type, type):
             raise TypeError(f'register expected a type, not an instance: {target_type!r}')
         exact = kwargs.pop('exact', None)
+        pure = kwargs.pop('pure', None)
         new_op_map = dict(kwargs)
 
         for op_name in sorted(set(self._op_auto_map.keys()) | set(new_op_map.keys())):
@@ -2121,6 +2130,15 @@ class TargetRegistry:
 
         for op_name, handler in new_op_map.items():
             self._op_type_map[op_name][target_type] = handler
+
+        if pure is not None:
+            pure_ops = self._pure_type_ops.setdefault(target_type, set())
+            if pure:
+                if 'get' in new_op_map:
+                    pure_ops.add('get')
+                pure_ops.update(('get', 'item', 'attr'))
+            else:
+                self._pure_type_ops.pop(target_type, None)
 
         if not exact:
             for op_name in new_op_map:
@@ -2388,7 +2406,7 @@ _DEFAULT_SCOPE.update({
 })
 
 
-def register(target_type, **kwargs):
+def register(target_type, pure=None, **kwargs):
     """Register *target_type* so :meth:`~Glommer.glom()` will
     know how to handle instances of that type as targets.
 
@@ -2413,6 +2431,8 @@ def register(target_type, **kwargs):
        iterate (callable): A function which takes a target object
           and returns an iterator. Defaults to :func:`iter` if
           *target_type* appears to be iterable.
+       pure (bool): Mark exact instances of *target_type* as having
+         side-effect-free get, item, and attribute reads.
        exact (bool): Whether or not to match instances of subtypes
           of *target_type*.
 
@@ -2427,6 +2447,8 @@ def register(target_type, **kwargs):
        methods instead.
 
     """
+    if pure is not None:
+        kwargs['pure'] = pure
     _DEFAULT_SCOPE[TargetRegistry].register(target_type, **kwargs)
     return
 
@@ -2473,7 +2495,7 @@ class Glommer:
         self.scope = ChainMap(dict(scope))
         self.scope[TargetRegistry] = TargetRegistry(register_default_types=register_default_types)
 
-    def register(self, target_type, **kwargs):
+    def register(self, target_type, pure=None, **kwargs):
         """Register *target_type* so :meth:`~Glommer.glom()` will
         know how to handle instances of that type as targets.
 
@@ -2486,6 +2508,8 @@ class Glommer:
            iterate (callable): A function which takes a target object
               and returns an iterator. Defaults to :func:`iter` if
               *target_type* appears to be iterable.
+           pure (bool): Mark exact instances of *target_type* as
+              having side-effect-free get, item, and attribute reads.
            exact (bool): Whether or not to match instances of subtypes
               of *target_type*.
 
@@ -2501,6 +2525,8 @@ class Glommer:
 
         """
         exact = kwargs.pop('exact', False)
+        if pure is not None:
+            kwargs['pure'] = pure
         self.scope[TargetRegistry].register(target_type, exact=exact, **kwargs)
         return
 

@@ -42,6 +42,10 @@ from glom.matching import (M,
                            Check,
                            CheckError)
 from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
+from glom.projection import (Project,
+                             Projection,
+                             CompiledProjection,
+                             compile_project)
 
 # there's no -ion word that really fits what "streaming" means.
 # generation, production, iteration, all have more relevant meanings
