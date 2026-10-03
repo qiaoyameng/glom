@@ -12,6 +12,16 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Evaluate declarative specs (``Ref``, container specs, ``Path``,
+  ``Val``, and sequential pipes) iteratively instead of recursively,
+  so deeply nested data (e.g. recursive ``Ref`` specs over
+  thousand-level vendor structures) no longer hits
+  ``RecursionError``. Results, lexical ``Ref`` scoping, ``SKIP`` /
+  ``STOP``, and error paths are unchanged, and error traces for very
+  deep structures are now elided in the middle to stay readable.
+
 ## 25.12.0
 
 _(December 28, 2025)_
