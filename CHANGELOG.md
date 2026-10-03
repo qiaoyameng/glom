@@ -12,6 +12,18 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## 25.12.1
+
+_(unreleased)_
+
+- Declarative specs (``Ref``, dict/list/tuple containers, ``Path``,
+  ``Val``, and sequential pipes) are now evaluated iteratively, so
+  recursive specs over deeply nested data (thousands of levels) no
+  longer hit Python's call stack limit. Error traces for very deep
+  structures are elided in the middle to stay readable, and ``bbrepr``
+  caps its recursion depth so error reporting itself cannot overflow
+  the stack.
+
 ## 25.12.0
 
 _(December 28, 2025)_

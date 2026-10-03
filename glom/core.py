@@ -239,6 +239,12 @@ def _format_trace_value(value, maxlen):
     return s
 
 
+_TRACE_STACK_LIMIT = 50
+# maximum number of target/spec entries included in a formatted trace
+# before the middle of the stack is elided; keeps error messages for
+# very deeply nested structures readable and bounded.
+
+
 def format_target_spec_trace(scope, root_error, width=TRACE_WIDTH, depth=0, prev_target=_MISSING, last_branch=True):
     """
     unpack a scope into a multi-line but short summary
@@ -256,7 +262,19 @@ def format_target_spec_trace(scope, root_error, width=TRACE_WIDTH, depth=0, prev
     recurse = lambda s, last=False: format_target_spec_trace(s, root_error, width, depth + 1, prev_target, last)
     tb_exc_line = lambda e: "".join(traceback.format_exception_only(type(e), e))[:-1]
     fmt_e = lambda e: indent + tick + tb_exc_line(e)
-    for scope, spec, target, error, branches in _unpack_stack(scope):
+    stack = _unpack_stack(scope)
+    elided = 0
+    if len(stack) > _TRACE_STACK_LIMIT:
+        head_count = _TRACE_STACK_LIMIT // 2
+        tail_count = _TRACE_STACK_LIMIT - head_count
+        elided = len(stack) - head_count - tail_count
+        stack = stack[:head_count] + [None] + stack[len(stack) - tail_count:]
+    for entry in stack:
+        if entry is None:
+            segments.append(indent + tick + '... (%d frames elided)' % elided)
+            prev_target = _MISSING
+            continue
+        scope, spec, target, error, branches = entry
         if target is not prev_target:
             segments.append(fmt_t(target))
         prev_target = target
@@ -520,9 +538,20 @@ class _BBRepr(Repr):
             if not isinstance(getattr(self, name), int):
                 continue
             setattr(self, name, 1024)
+        # ...except for the recursion depth limit, which stays low
+        # enough that repr-ing a deeply nested structure cannot
+        # overflow the Python call stack (each level of container
+        # reprs costs a few Python frames)
+        self.maxlevel = 100
 
     def repr1(self, x, level):
-        ret = Repr.repr1(self, x, level)
+        try:
+            ret = Repr.repr1(self, x, level)
+        except RecursionError:
+            # belt and suspenders for very deep structures on
+            # nearly-exhausted stacks; a truncated repr is always
+            # better than failing error reporting
+            return '...'
         if not ret.startswith('<'):
             return ret
         return _BUILTIN_ID_NAME_MAP.get(id(x), ret)
@@ -2269,6 +2298,13 @@ def glom(target, spec, **kwargs):
     scope[ROOT] = scope
     scope[T] = target
     scope.update(kwargs.pop('scope', {}))
+    # hoist constant bindings into the root map so that _glom's child
+    # scopes can copy them down in O(1) (see _HOISTED_SCOPE_KEYS)
+    root_map = scope.maps[0]
+    for key in _HOISTED_SCOPE_KEYS:
+        if key not in root_map:
+            root_map[key] = scope[key]
+    root_map[_REF_DEFS] = {}
     err = None
     if kwargs:
         raise TypeError('unexpected keyword args: %r' % sorted(kwargs.keys()))
@@ -2330,38 +2366,364 @@ def _has_callable_glomit(obj):
     return callable(glomit)  and not isinstance(obj, type)
 
 
+class _Scope(ChainMap):
+    """A ChainMap tuned for glom's deep evaluation scopes.
+
+    ``ChainMap.new_child()`` copies the parent's whole map list, so a
+    chain of N nested scopes costs O(N) time per child and O(N**2)
+    memory overall. That quadratic growth makes deeply nested
+    declarative specs (e.g. recursive Refs over deeply nested data)
+    impractical, so ``_Scope`` instead links each child to its parent
+    scope, keeping scope creation O(1). Lookups walk the parent chain
+    iteratively.
+    """
+    __slots__ = ()
+
+    def __init__(self, own_map, parent):
+        self.maps = [own_map, parent]
+
+    def new_child(self, m=None):
+        if m is None:
+            m = {}
+        return self.__class__(m, self)
+
+    @property
+    def parents(self):
+        parent = self.maps[1]
+        if isinstance(parent, ChainMap):
+            return parent
+        return ChainMap(parent)
+
+    def __getitem__(self, key):
+        scope = self
+        while isinstance(scope, _Scope):
+            try:
+                return scope.maps[0][key]
+            except KeyError:
+                scope = scope.maps[1]
+        return scope[key]
+
+    def __contains__(self, key):
+        scope = self
+        while isinstance(scope, _Scope):
+            if key in scope.maps[0]:
+                return True
+            scope = scope.maps[1]
+        return key in scope
+
+    def __iter__(self):
+        seen = set()
+        scope = self
+        while isinstance(scope, _Scope):
+            for key in scope.maps[0]:
+                if key not in seen:
+                    seen.add(key)
+                    yield key
+            scope = scope.maps[1]
+        for key in scope:
+            if key not in seen:
+                yield key
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+    def __repr__(self):
+        return '%s(%r, ...)' % (self.__class__.__name__, self.maps[0])
+
+
+# scope keys which are constant for the duration of an evaluation and
+# are read on the hot path; copied into each child scope at creation
+# time so reads stay O(1) no matter how deep the scope chain gets.
+# (MODE and MIN_MODE get the same treatment, but their values change
+# from level to level, so they are handled separately.)
+_HOISTED_SCOPE_KEYS = (glom, TargetRegistry, ROOT)
+
+
+# continuation frame kinds for the iterative evaluator in _glom().
+# frames are stored as lists so they can be updated in place as
+# evaluation advances through a declarative spec.
+_REF_FRAME = 'ref'
+_DICT_FRAME = 'dict'
+_LIST_FRAME = 'list'
+_TUPLE_FRAME = 'tuple'
+
+_PENDING_KEY = make_sentinel('_PENDING_KEY')
+
+_REF_DEFS = make_sentinel('_REF_DEFS')
+# key under which each evaluation keeps a name -> [subspec, ...] map of
+# the currently active Ref definitions. The lists act as lexical
+# stacks: a Ref definition is pushed when its Ref node starts
+# evaluating and popped when it finishes, so lookups always resolve to
+# the innermost active definition without walking the scope chain.
+
+# the full set of bindings copied into each child scope the evaluator
+# creates: the hoisted constants above, plus the Ref definition cache
+_CHILD_SCOPE_COPY_KEYS = _HOISTED_SCOPE_KEYS + (_REF_DEFS,)
+
+
+def _pop_ref_def(frame):
+    """Undo a Ref definition made by a _REF_FRAME, if any. Idempotent."""
+    name = frame[2]
+    if name is not None:
+        cache = frame[1].maps[0][_REF_DEFS]
+        defs = cache[name]
+        defs.pop()
+        if not defs:
+            del cache[name]
+        frame[2] = None
+
+
+def _record_child_error(scope, e):
+    """Record exception *e* on *scope*, mirroring what _glom's recursive
+    except clause did, so error traces look the same whether evaluation
+    recursed through Python frames or advanced through the explicit
+    continuation stack.
+    """
+    parent = scope[UP]
+    parent.maps[0][CHILD_ERRORS].append(scope)
+    scope.maps[0][CUR_ERROR] = e
+    if NO_PYFRAME in parent.maps[0]:
+        cur_scope = parent
+        while NO_PYFRAME in cur_scope.maps[0]:
+            cur_scope[UP].maps[0][CHILD_ERRORS].append(cur_scope)
+            cur_scope.maps[0][CUR_ERROR] = e
+            cur_scope = cur_scope[UP]
+
+
 def _glom(target, spec, scope):
-    parent = scope
-    pmap = parent.maps[0]
-    scope = scope.new_child({
-        T: target,
-        Spec: spec,
-        UP: parent,
-        CHILD_ERRORS: [],
-        MODE: pmap[MODE],
-        MIN_MODE: pmap[MIN_MODE],
-    })
-    pmap[LAST_CHILD_SCOPE] = scope
+    # Iterative evaluator for glom's declarative spec types (dict, list,
+    # tuple, str, TType, Ref, Val, Path, Pipe). Sub-spec evaluation is
+    # driven by an explicit continuation stack, so deeply nested
+    # declarative specs (e.g. recursive Refs walking deeply nested data)
+    # do not consume Python call stack proportional to the data depth.
+    #
+    # Non-declarative specs (arbitrary callables and glomit() objects)
+    # are still invoked directly; any recursion inside user-provided
+    # functions is unaffected and remains the caller's responsibility.
+    stack = []
+    while True:
+        parent = scope
+        pmap = parent.maps[0]
+        child_map = {
+            T: target,
+            Spec: spec,
+            UP: parent,
+            CHILD_ERRORS: [],
+            MODE: pmap[MODE],
+            MIN_MODE: pmap[MIN_MODE],
+        }
+        # copy constant bindings down so reads below stay O(1) no
+        # matter how deep the scope chain gets
+        for key in _CHILD_SCOPE_COPY_KEYS:
+            try:
+                child_map[key] = pmap[key]
+            except KeyError:
+                child_map[key] = parent[key]
+        scope = _Scope(child_map, parent)
+        pmap[LAST_CHILD_SCOPE] = scope
 
-    try:
-        if type(spec) is TType:  # must go first, due to callability
-            scope[MIN_MODE] = None  # None is tombstone
-            return _t_eval(target, spec, scope)
-        elif _has_callable_glomit(spec):
-            scope[MIN_MODE] = None
-            return spec.glomit(target, scope)
+        try:
+            spec_type = type(spec)
+            if spec_type is TType:  # must go first, due to callability
+                scope[MIN_MODE] = None  # None is tombstone
+                result = _t_eval(target, spec, scope)
+            elif scope.maps[0][glom] is not _glom:
+                # a custom glom binding (e.g. Inspect's trace wrapper)
+                # is in effect; evaluate through the legacy recursive
+                # handlers so every nested evaluation goes through the
+                # custom binding, exactly as before
+                if _has_callable_glomit(spec):
+                    scope[MIN_MODE] = None
+                    result = spec.glomit(target, scope)
+                else:
+                    result = (scope.maps[0][MIN_MODE] or scope.maps[0][MODE])(target, spec, scope)
+            elif spec_type is Ref:
+                scope[MIN_MODE] = None
+                subspec = spec.subspec
+                scope_key = (Ref, spec.name)
+                if subspec is _MISSING:
+                    defs = scope.maps[0][_REF_DEFS].get(spec.name)
+                    if defs:
+                        subspec = defs[-1]
+                    else:
+                        # definition predates this evaluation's machine
+                        # (e.g. written by a Ref subclass's glomit)
+                        subspec = scope[scope_key]
+                    defined_name = None
+                else:
+                    scope[scope_key] = subspec
+                    ref_cache = scope.maps[0][_REF_DEFS]
+                    defs = ref_cache.get(spec.name)
+                    if defs is None:
+                        ref_cache[spec.name] = defs = []
+                    defs.append(subspec)
+                    defined_name = spec.name
+                # identity continuation, kept so the Ref's scope stays
+                # on the error path, matching recursive evaluation
+                stack.append([_REF_FRAME, scope, defined_name])
+                spec = subspec
+                continue
+            elif spec_type is Val:
+                scope[MIN_MODE] = None
+                result = spec.value
+            elif spec_type is Path:
+                scope[MIN_MODE] = None
+                result = _t_eval(target, spec.path_t, scope)
+            elif spec_type is Pipe:
+                scope[MIN_MODE] = None
+                steps = spec.steps
+                if not steps:
+                    result = target
+                else:
+                    stack.append([_TUPLE_FRAME, scope, steps, 0, target, scope])
+                    spec = steps[0]
+                    continue
+            elif _has_callable_glomit(spec):
+                scope[MIN_MODE] = None
+                result = spec.glomit(target, scope)
+            else:
+                mode = scope.maps[0][MIN_MODE] or scope.maps[0][MODE]
+                if mode is not AUTO:
+                    result = mode(target, spec, scope)
+                elif spec_type is str:  # shortcut to make deep-get use case faster
+                    result = _t_eval(target, Path.from_text(spec).path_t, scope)
+                elif isinstance(spec, dict):
+                    ret = type(spec)()
+                    items_iter = iter(spec.items())
+                    try:
+                        field, subspec = next(items_iter)
+                    except StopIteration:
+                        result = ret
+                    else:
+                        stack.append([_DICT_FRAME, scope, target, items_iter, ret, field, _PENDING_KEY])
+                        spec = subspec
+                        continue
+                elif isinstance(spec, list):
+                    subspec = spec[0]
+                    iterate = scope[TargetRegistry].get_handler('iterate', target, path=scope[Path])
+                    try:
+                        iterator = iterate(target)
+                    except Exception as e:
+                        raise TypeError('failed to iterate on instance of type %r at %r (got %r)'
+                                        % (target.__class__.__name__, Path(*scope[Path]), e))
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        result = []
+                    else:
+                        base_path = scope[Path]
+                        scope[Path] = base_path + [0]
+                        stack.append([_LIST_FRAME, scope, subspec, iterator, [], base_path, 0])
+                        target = item
+                        spec = subspec
+                        continue
+                elif isinstance(spec, tuple):
+                    if not spec:
+                        result = target
+                    else:
+                        stack.append([_TUPLE_FRAME, scope, spec, 0, target, scope])
+                        spec = spec[0]
+                        continue
+                elif isinstance(spec, basestring):
+                    result = Path.from_text(spec).glomit(target, scope)
+                elif callable(spec):
+                    result = spec(target)
+                else:
+                    raise TypeError('expected spec to be dict, list, tuple, callable, string,'
+                                    ' or other Spec-like type, not: %r' % (spec,))
+        except Exception as e:
+            _record_child_error(scope, e)
+            for frame in reversed(stack):
+                _record_child_error(frame[1], e)
+                if frame[0] is _REF_FRAME:
+                    _pop_ref_def(frame)
+            raise
 
-        return (scope.maps[0][MIN_MODE] or scope.maps[0][MODE])(target, spec, scope)
-    except Exception as e:
-        scope.maps[1][CHILD_ERRORS].append(scope)
-        scope.maps[0][CUR_ERROR] = e
-        if NO_PYFRAME in scope.maps[1]:
-            cur_scope = scope[UP]
-            while NO_PYFRAME in cur_scope.maps[0]:
-                cur_scope.maps[1][CHILD_ERRORS].append(cur_scope)
-                cur_scope.maps[0][CUR_ERROR] = e
-                cur_scope = cur_scope[UP]
-        raise
+        # a node finished evaluating; deliver its result to the
+        # innermost continuation, if any
+        cur_frame = None
+        try:
+            while stack:
+                cur_frame = stack.pop()
+                kind = cur_frame[0]
+                if kind is _REF_FRAME:
+                    _pop_ref_def(cur_frame)
+                    continue
+                if kind is _DICT_FRAME:
+                    _, frame_scope, frame_target, items_iter, ret, field, saved_val = cur_frame
+                    if saved_val is not _PENDING_KEY:
+                        # result is the evaluated key of a Spec/TType field
+                        ret[result] = saved_val
+                        cur_frame[6] = _PENDING_KEY
+                    else:
+                        val = result
+                        if val is not SKIP:
+                            if type(field) in (Spec, TType):
+                                cur_frame[6] = val
+                                stack.append(cur_frame)
+                                target, spec, scope = frame_target, field, frame_scope
+                                break
+                            ret[field] = val
+                    try:
+                        field, subspec = next(items_iter)
+                    except StopIteration:
+                        result = ret
+                        continue
+                    cur_frame[5] = field
+                    stack.append(cur_frame)
+                    target, spec, scope = frame_target, subspec, frame_scope
+                    break
+                if kind is _LIST_FRAME:
+                    _, frame_scope, subspec, iterator, ret, base_path, index = cur_frame
+                    if result is STOP:
+                        result = ret
+                        continue
+                    if result is not SKIP:
+                        ret.append(result)
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        result = ret
+                        continue
+                    index += 1
+                    cur_frame[6] = index
+                    frame_scope[Path] = base_path + [index]
+                    stack.append(cur_frame)
+                    target, spec, scope = item, subspec, frame_scope
+                    break
+                # _TUPLE_FRAME
+                _, frame_scope, steps, index, res, chain_scope = cur_frame
+                subspec = steps[index]
+                if result is STOP:
+                    result = res
+                    continue
+                if result is not SKIP:
+                    res = result
+                    if not isinstance(subspec, list):
+                        chain_scope[Path] += [getattr(subspec, '__name__', subspec)]
+                index += 1
+                if index >= len(steps):
+                    result = res
+                    continue
+                chain_scope = chain_child(chain_scope)
+                cur_frame[3] = index
+                cur_frame[4] = res
+                cur_frame[5] = chain_scope
+                stack.append(cur_frame)
+                target, spec, scope = res, steps[index], chain_scope
+                break
+            else:
+                return result
+        except Exception as e:
+            if cur_frame is not None:
+                _record_child_error(cur_frame[1], e)
+                if cur_frame[0] is _REF_FRAME:
+                    _pop_ref_def(cur_frame)
+            for frame in reversed(stack):
+                _record_child_error(frame[1], e)
+                if frame[0] is _REF_FRAME:
+                    _pop_ref_def(frame)
+            raise
 
 
 def AUTO(target, spec, scope):
