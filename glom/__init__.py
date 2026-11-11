@@ -48,4 +48,8 @@ from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 # elsewhere. (maybe procrastination :P)
 from glom.streaming import Iter
 
+# budgeted grouping that spills inactive groups to a local SQLite store
+from glom.spill import (SpillGroup, SpillableAgg, SpillError,
+                       SpillCount, SpillSum, SpillMin, SpillMax)
+
 from glom._version import __version__

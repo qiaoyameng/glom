@@ -27,7 +27,38 @@ specifier types and two convenience functions:
 
 .. autoclass:: glom.Fold
 
+Spill-to-disk grouping with SpillGroup
+--------------------------------------
+
+When a grouping operation would accumulate too many groups to fit in
+memory, :class:`~glom.SpillGroup` keeps the number of *active* (in-memory)
+groups bounded by a shared ``budget``. Once the budget is exceeded, the
+least-recently-used group's accumulator state is encoded through an
+explicit, JSON-based protocol and staged in a local :mod:`sqlite3`
+database. When that group appears again its state is decoded and swapped
+back into memory -- no extra database process is required.
+
+Only aggregators that implement the spill encoding protocol
+(:class:`~glom.SpillableAgg`) are supported, so arbitrary objects are
+never pickled. The built-in spill aggregators cover count, sum, min and
+max, including their nested dict/list combinations. Final groups are
+delivered in first-seen order.
+
+.. autoclass:: glom.SpillGroup
+
+.. autoclass:: glom.SpillableAgg
+
+.. autoclass:: glom.SpillCount
+
+.. autoclass:: glom.SpillSum
+
+.. autoclass:: glom.SpillMin
+
+.. autoclass:: glom.SpillMax
+
 Exceptions
 ----------
 
 .. autoclass:: glom.FoldError
+
+.. autoclass:: glom.SpillError

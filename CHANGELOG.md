@@ -12,6 +12,19 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `SpillGroup`, an explicit spill-to-disk grouping mode with a
+  shared in-memory group budget. Inactive groups are encoded through an
+  explicit JSON state protocol (never pickle) and staged in a local
+  SQLite database, then swapped back in when seen again. Ships
+  `SpillableAgg` plus `SpillCount`, `SpillSum`, `SpillMin` and
+  `SpillMax` (and their nested dict/list combinations); custom
+  aggregators provide their own encode/restore interface. Group keys are
+  restricted to supported scalar tuples, groups are delivered in
+  first-seen order, and staging is cleaned up on error, early stop and
+  explicit close.
+
 ## 25.12.0
 
 _(December 28, 2025)_

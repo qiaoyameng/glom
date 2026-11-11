@@ -489,6 +489,8 @@ def test_all_public_errors():
 
     _test_exc(glom.BadSpec, range(5), glom.grouping.Group([{T: T}]))
 
+    _test_exc(glom.SpillError, [{'x': 1}], glom.SpillGroup({T: glom.SpillCount()}))
+
     _test_exc(glom.PathAccessError, {}, 'a.b.c')
 
     _test_exc(glom.UnregisteredTarget, 'kurt', [glom.T])
