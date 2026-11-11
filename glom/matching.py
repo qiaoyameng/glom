@@ -19,6 +19,20 @@ from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation,
 
 _MISSING = make_sentinel('_MISSING')
 
+# scope key under which a single Match() evaluation keeps its named
+# Capture bindings; the value is a plain dict so failed branches can be
+# rolled back by swapping in a copy
+_CAPTURES = make_sentinel('_CAPTURES')
+
+
+def _get_captures(scope):
+    try:
+        return scope[_CAPTURES]
+    except KeyError:
+        captures = {}
+        scope[_CAPTURES] = captures
+        return captures
+
 
 # NOTE: it is important that MatchErrors be cheap to construct,
 # because negative matches are part of normal control flow
@@ -147,12 +161,18 @@ class Match:
 
     def glomit(self, target, scope):
         scope[MODE] = _glom_match
+        # fresh binding store per evaluation; kept on the scope so
+        # nested And/Or/Not/Capture specs can share it, and dropped
+        # again before returning so no state escapes this evaluation
+        scope.maps[0][_CAPTURES] = {}
         try:
             ret = scope[glom](target, self.spec, scope)
         except GlomError:
             if self.default is _MISSING:
                 raise
             ret = arg_val(target, self.default, scope)
+        finally:
+            del scope.maps[0][_CAPTURES]
         return ret
 
     def verify(self, target):
@@ -316,8 +336,17 @@ class And(_Bool):
     def _glomit(self, target, scope):
         # all children must match without exception
         result = target  # so that And() == True, similar to all([]) == True
-        for child in self.children:
-            result = scope[glom](target, child, scope)
+        captures = _get_captures(scope)
+        staged = dict(captures)
+        scope.maps[0][_CAPTURES] = staged
+        try:
+            for child in self.children:
+                result = scope[glom](target, child, scope)
+        except Exception:
+            scope.maps[0][_CAPTURES] = captures  # discard partial bindings
+            raise
+        captures.update(staged)  # commit shared bindings on success
+        scope.maps[0][_CAPTURES] = captures
         return result
 
     def __and__(self, other):
@@ -335,11 +364,23 @@ class Or(_Bool):
     __slots__ = ('children',)
 
     def _glomit(self, target, scope):
+        captures = _get_captures(scope)
         for child in self.children[:-1]:
+            # each branch gets its own copy so a failed branch cannot
+            # leak bindings into later branches or into the caller
+            staged = dict(captures)
+            scope.maps[0][_CAPTURES] = staged
             try:  # one child must match without exception
-                return scope[glom](target, child, scope)
+                result = scope[glom](target, child, scope)
             except GlomError:
-                pass
+                scope.maps[0][_CAPTURES] = captures  # restore for next branch
+            else:
+                captures.update(staged)  # only the winning branch is committed
+                scope.maps[0][_CAPTURES] = captures
+                return result
+        # last branch's exceptions propagate; any bindings it made are
+        # committed by its own successful return, otherwise rolled back
+        scope.maps[0][_CAPTURES] = captures
         return scope[glom](target, self.children[-1], scope)
 
     def __or__(self, other):
@@ -361,12 +402,18 @@ class Not(_Bool):
         self.child = child
 
     def glomit(self, target, scope):
-        try:  # one child must match without exception
+        # the child's bindings must never escape a Not, whether or
+        # not the child matches, so it gets a throwaway copy
+        captures = _get_captures(scope)
+        scope.maps[0][_CAPTURES] = dict(captures)
+        try:
             scope[glom](target, self.child, scope)
         except GlomError:
             return target
         else:
             raise GlomError("child shouldn't have passed", self.child)
+        finally:
+            scope.maps[0][_CAPTURES] = captures
 
     def _m_repr(self):
         if isinstance(self.child, (_MType, _MExpr)):
@@ -567,6 +614,90 @@ class _MType:
 M = _MType()
 
 
+class Capture:
+    """Used inside a :class:`~glom.Match` spec, binds the current target
+    value to *name* and returns it, so the value can be referenced
+    elsewhere in the same match with :class:`~glom.CaptureRef`.
+
+    For example, to require that a nested record points back at its
+    parent's id::
+
+      >>> target = {'id': 1, 'child': {'parent_id': 1}}
+      >>> spec = Match({'id': Capture('id'), 'child': {'parent_id': CaptureRef('id')}})
+      >>> glom(target, spec)
+      {'id': 1, 'child': {'parent_id': 1}}
+
+    If the name was already bound earlier in the same match, the
+    target must be equal (``==``) to the previously captured value:
+
+      >>> glom({'id': 1, 'child': {'parent_id': 2}}, spec)
+      Traceback (most recent call last):
+      ...
+      MatchError: target 2 != previously captured 1 (name 'id')
+
+    Bindings live only for the duration of one :class:`~glom.Match`
+    evaluation; nothing is stored on the spec itself, so a spec can be
+    shared across calls and threads.
+
+    Args:
+       name: The name to bind the target value to.
+    """
+    __slots__ = ('name',)
+
+    def __init__(self, name):
+        self.name = name
+
+    def glomit(self, target, scope):
+        captures = _get_captures(scope)
+        if self.name in captures:
+            captured = captures[self.name]
+            if target != captured:
+                raise MatchError(
+                    "target {0!r} != previously captured {1!r} (name {2!r})",
+                    target, captured, self.name)
+        else:
+            captures[self.name] = target
+        return target
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({bbrepr(self.name)})'
+
+
+class CaptureRef:
+    """Used inside a :class:`~glom.Match` spec, matches the current
+    target against the value previously bound to *name* by
+    :class:`~glom.Capture`.
+
+    The target must be equal (``==``) to the captured value. A name
+    which has not been bound yet never matches, even against ``None``:
+
+      >>> glom(None, Match(CaptureRef('never_bound')))
+      Traceback (most recent call last):
+      ...
+      MatchError: no value captured under name 'never_bound'
+
+    Args:
+       name: The name of a value captured by :class:`~glom.Capture`.
+    """
+    __slots__ = ('name',)
+
+    def __init__(self, name):
+        self.name = name
+
+    def glomit(self, target, scope):
+        captures = _get_captures(scope)
+        if self.name not in captures:
+            raise MatchError("no value captured under name {0!r}", self.name)
+        captured = captures[self.name]
+        if target != captured:
+            raise MatchError(
+                "target {0!r} != captured {1!r} (name {2!r})",
+                target, captured, self.name)
+        return target
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({bbrepr(self.name)})'
+
 
 class Optional:
     """Used as a :class:`dict` key in a :class:`~glom.Match()` spec,
@@ -688,21 +819,29 @@ def _handle_dict(target, spec, scope):
         if type(key) is Optional and key.default is not _MISSING}
     result = {}
     for key, val in target.items():
+        # spec keys are tried in order like an Or: isolate each trial
+        # so failed key matches cannot leak Capture bindings
+        captures = _get_captures(scope)
         for maybe_spec_key in spec_keys:
             # handle Required as a special case here rather than letting it be a stand-alone spec
             if type(maybe_spec_key) is Required:
                 spec_key = maybe_spec_key.key
             else:
                 spec_key = maybe_spec_key
+            staged = dict(captures)
+            scope.maps[0][_CAPTURES] = staged
             try:
                 key = scope[glom](key, spec_key, scope)
             except GlomError:
-                pass
+                scope.maps[0][_CAPTURES] = captures
             else:
+                captures.update(staged)
+                scope.maps[0][_CAPTURES] = captures
                 result[key] = scope[glom](val, spec[maybe_spec_key], chain_child(scope))
                 required.discard(maybe_spec_key)
                 break
         else:
+            scope.maps[0][_CAPTURES] = captures
             raise MatchError("key {0!r} didn't match any of {1!r}", key, spec_keys)
     for key in set(defaults) - set(result):
         result[key] = arg_val(target, defaults[key], scope)
@@ -722,13 +861,25 @@ def _glom_match(target, spec, scope):
             raise TypeMatchError(type(target), type(spec))
         result = []
         for item in target:
+            # the child specs behave like an Or: each trial is isolated
+            # so a failed child cannot leak Capture bindings to the next
+            captures = _get_captures(scope)
+            matched = False
             for child in spec:
+                staged = dict(captures)
+                scope.maps[0][_CAPTURES] = staged
                 try:
-                    result.append(scope[glom](item, child, scope))
-                    break
+                    child_result = scope[glom](item, child, scope)
                 except GlomError as e:
                     last_error = e
-            else:  # did not break, something went wrong
+                    scope.maps[0][_CAPTURES] = captures
+                else:
+                    captures.update(staged)
+                    scope.maps[0][_CAPTURES] = captures
+                    result.append(child_result)
+                    matched = True
+                    break
+            if not matched:  # did not break, something went wrong
                 if target and not spec:
                     raise MatchError(
                         "{0!r} does not match empty {1}", target, type(spec).__name__)
@@ -846,12 +997,21 @@ class Switch:
 
 
     def glomit(self, target, scope):
+        captures = _get_captures(scope)
         for keyspec, valspec in self.cases:
+            # like Or, each key trial gets an isolated copy and only
+            # the matching key's bindings are committed
+            staged = dict(captures)
+            scope.maps[0][_CAPTURES] = staged
             try:
                 scope[glom](target, keyspec, scope)
-            except GlomError as ge:
+            except GlomError:
+                scope.maps[0][_CAPTURES] = captures
                 continue
+            captures.update(staged)
+            scope.maps[0][_CAPTURES] = captures
             return scope[glom](target, valspec, chain_child(scope))
+        scope.maps[0][_CAPTURES] = captures
         if self.default is not _MISSING:
             return arg_val(target, self.default, scope)
         raise MatchError("no matches for target in %s"  % self.__class__.__name__)

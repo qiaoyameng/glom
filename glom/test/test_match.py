@@ -6,7 +6,7 @@ import pytest
 from glom import glom, S, Val, T, A, Fill, Ref, Coalesce, STOP, Switch
 from glom.matching import (
     Match, M, MatchError, TypeMatchError, And, Or, Not,
-    Optional, Required, Regex)
+    Optional, Required, Regex, Capture, CaptureRef)
 from glom.core import Auto, SKIP, Ref
 
 try:
@@ -508,3 +508,157 @@ def test_switch():
 
 def test_nested_dict():
     assert glom({1: 2}, Match({A.t: S.t})) == {1: 1}
+
+
+def test_capture_parent_id():
+    # the motivating case: a deeply nested record's parent_id must
+    # equal the outer record's id
+    spec = Match({'id': Capture('id'),
+                  'child': {'parent_id': CaptureRef('id')}})
+    target = {'id': 1, 'child': {'parent_id': 1}}
+    # a successful match returns the target, bindings resolved in place
+    assert glom(target, spec) == {'id': 1, 'child': {'parent_id': 1}}
+
+    # a conflicting parent_id fails
+    with pytest.raises(MatchError):
+        glom({'id': 1, 'child': {'parent_id': 2}}, spec)
+
+
+def test_capture_recapture_must_be_equal():
+    spec = Match({'a': Capture('x'), 'b': Capture('x')})
+    assert glom({'a': 5, 'b': 5}, spec) == {'a': 5, 'b': 5}
+    with pytest.raises(MatchError):
+        glom({'a': 5, 'b': 6}, spec)
+
+
+def test_capture_ref_unbound_is_not_none():
+    # an unbound reference never matches, even against a real None
+    with pytest.raises(MatchError):
+        glom(None, Match(CaptureRef('never_bound')))
+    # but a captured None can be referenced
+    spec = Match({'a': Capture('n'), 'b': CaptureRef('n')})
+    assert glom({'a': None, 'b': None}, spec) == {'a': None, 'b': None}
+
+
+def test_capture_and_shares_bindings():
+    # And children see each other's captures, in order
+    spec = Match(And(Capture('x'), CaptureRef('x')))
+    assert glom(3, spec) == 3
+    # a failed And does not leak partial bindings to the outside
+    spec = Match(And(And(Capture('x'), M == 0), CaptureRef('x')))
+    with pytest.raises(MatchError):
+        glom(1, spec)
+
+
+def test_capture_or_branch_isolation():
+    # first branch captures 'x' then fails; second branch must see a
+    # clean binding table and be free to capture 'x' itself
+    spec = Match(Or(And(Capture('x'), int, M == 0),
+                    And(Capture('x'), str)))
+    assert glom('hi', spec) == 'hi'
+
+    # same idea, with the int/str id conflict: first branch captures
+    # the outer int id, then fails on the inner str id; the second
+    # branch is unaffected by the aborted capture
+    spec = Match(Or(
+        {'id': Capture('id'), 'child': {'parent_id': CaptureRef('id')}},
+        {'id': int, 'child': {'parent_id': str}}))
+    target = {'id': 1, 'child': {'parent_id': '1'}}
+    assert glom(target, spec) == target
+
+
+def test_capture_not_does_not_publish():
+    # the Not child captures 'x' and then fails, so Not succeeds;
+    # the capture must not escape, so the reference is unbound
+    spec = Match(And(Not(And(Capture('x'), M == 0)), CaptureRef('x')))
+    with pytest.raises(MatchError):
+        glom(1, spec)
+
+
+def test_capture_nested_structures():
+    # nested lists share bindings across items
+    spec = Match([{'v': Capture('x')}, {'v': CaptureRef('x')}])
+    assert glom([{'v': 1}, {'v': 1}], spec) == [{'v': 1}, {'v': 1}]
+    with pytest.raises(MatchError):
+        glom([{'v': 1}, {'v': 2}], spec)
+
+    # tuples too
+    assert glom((1, 1), Match((Capture('x'), CaptureRef('x')))) == (1, 1)
+
+    # Optional keys capture when present
+    spec = Match({Optional('a'): Capture('x'), 'b': CaptureRef('x')})
+    assert glom({'a': 7, 'b': 7}, spec) == {'a': 7, 'b': 7}
+    # when the Optional key is absent, the reference is unbound
+    with pytest.raises(MatchError):
+        glom({'b': 7}, spec)
+
+    # Switch commits only the matching key's bindings
+    spec = Match(Switch([(And(str, Capture('x')), CaptureRef('x')),
+                         (int, Val('an int'))]))
+    assert glom('s', spec) == 's'
+    assert glom(1, spec) == 'an int'
+    # a failed key's captures do not leak into later keys
+    spec = Match(Switch([(And(str, Capture('x'), M == 'z'), Val('z')),
+                         (str, Val('other'))]))
+    assert glom('s', spec) == 'other'
+
+
+def test_capture_no_shared_state_between_calls():
+    spec = Match({'a': Capture('x'), 'b': CaptureRef('x')})
+    assert glom({'a': 1, 'b': 1}, spec) == {'a': 1, 'b': 1}
+    # a second call with different values must not see the first call's bindings
+    assert glom({'a': 2, 'b': 2}, spec) == {'a': 2, 'b': 2}
+    with pytest.raises(MatchError):
+        glom({'a': 3, 'b': 1}, spec)
+
+
+def test_capture_no_shared_state_between_threads():
+    import threading
+    spec = Match({'a': Capture('x'), 'b': CaptureRef('x')})
+    errors = []
+
+    def worker(n):
+        try:
+            for _ in range(100):
+                assert glom({'a': n, 'b': n}, spec) == {'a': n, 'b': n}
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+
+
+def test_capture_failure_does_not_mutate_target():
+    import copy
+    target = {'id': 1, 'child': {'parent_id': '1'}}
+    original = copy.deepcopy(target)
+    spec = Match({'id': Capture('id'),
+                  'child': {'parent_id': CaptureRef('id')}})
+    with pytest.raises(MatchError):
+        glom(target, spec)
+    # the input record is untouched, and no Capture/CaptureRef spec
+    # objects were stuffed into it
+    assert target == original
+    assert not any(isinstance(v, (Capture, CaptureRef))
+                   for v in list(target.values()) + list(target['child'].values()))
+
+
+def test_capture_conflict_is_locatable():
+    # outer id is an int, inner parent_id is a str; the error should
+    # name the capture and both values so the conflict can be located
+    spec = Match({'id': Capture('id'),
+                  'child': {'parent_id': CaptureRef('id')}})
+    with pytest.raises(MatchError) as excinfo:
+        glom({'id': 1, 'child': {'parent_id': '1'}}, spec)
+    msg = str(excinfo.value)
+    assert "'id'" in msg
+    assert "'1'" in msg
+
+
+def test_capture_repr():
+    assert repr(Capture('x')) == "Capture('x')"
+    assert repr(CaptureRef('x')) == "CaptureRef('x')"

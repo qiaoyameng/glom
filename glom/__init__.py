@@ -40,7 +40,9 @@ from glom.matching import (M,
                            Required,
                            Switch,
                            Check,
-                           CheckError)
+                           CheckError,
+                           Capture,
+                           CaptureRef)
 from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 
 # there's no -ion word that really fits what "streaming" means.

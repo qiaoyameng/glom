@@ -66,6 +66,25 @@ object-oriented approach can be more suitable.
 
 .. autoclass:: glom.Not
 
+Capturing and referencing values
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes a value in one part of the target must equal a value in
+another part, like a nested record's ``parent_id`` matching its
+parent's ``id``. :class:`~glom.Capture` binds the current value to a
+name, and :class:`~glom.CaptureRef` matches against a previously
+bound name.
+
+Bindings live only for the duration of a single :class:`~glom.Match`
+evaluation. :class:`~glom.And` shares bindings between its children,
+:class:`~glom.Or` and :class:`~glom.Switch` only commit the bindings
+of the branch that matched, and :class:`~glom.Not` never publishes
+bindings.
+
+.. autoclass:: glom.Capture
+
+.. autoclass:: glom.CaptureRef
+
 String matching
 ~~~~~~~~~~~~~~~
 

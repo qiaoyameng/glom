@@ -12,6 +12,15 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `Capture` and `CaptureRef` match specifiers for named value
+  captures and back-references inside a `Match`, letting a nested
+  value be checked against an earlier one (e.g. a record's
+  `parent_id` matching its parent's `id`). Bindings are scoped to a
+  single match evaluation, shared across `And`, isolated per branch
+  in `Or`/`Switch`, and never published by `Not`.
+
 ## 25.12.0
 
 _(December 28, 2025)_
