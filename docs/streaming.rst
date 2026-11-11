@@ -11,6 +11,7 @@ Streaming & Iteration
 .. autoclass:: glom.Iter
 
    .. automethod:: map
+   .. automethod:: attempt
    .. automethod:: filter
    .. automethod:: chunked
    .. automethod:: split
@@ -22,3 +23,9 @@ Streaming & Iteration
    .. automethod:: dropwhile
    .. automethod:: all
    .. automethod:: first
+
+.. autoclass:: glom.AttemptSuccess
+   :members:
+
+.. autoclass:: glom.AttemptFailure
+   :members:

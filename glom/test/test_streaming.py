@@ -3,7 +3,12 @@ import pytest
 from itertools import count, dropwhile, chain
 
 from glom import Iter
-from glom import glom, SKIP, STOP, T, Call, Spec, Glommer, Check, SKIP
+from glom import glom, SKIP, STOP, T, Call, Spec, Glommer, Check, SKIP, Path
+from glom import (AttemptSuccess, AttemptFailure,
+                   ATTEMPT_MISSING, ATTEMPT_SKIP, ATTEMPT_STOP, ATTEMPT_ERROR,
+                   GlomError, PathAccessError)
+from glom.core import _MISSING
+from glom.streaming import _attempt_iter
 
 
 RANGE_5 = list(range(5))
@@ -207,3 +212,176 @@ def test_all():
     assert out == list(range(10))
     assert next(int_iter, None) is None
     assert repr(Iter().all()) == 'Pipe(Iter(), list)'
+
+
+def test_attempt_basic():
+    target = [{'a': 1}, {}, {'a': 3}]
+    out = glom(target, Iter().attempt(T['a']).all())
+
+    assert [r.ok for r in out] == [True, False, True]
+    assert [r.index for r in out] == [0, 1, 2]
+    assert out[0] == AttemptSuccess(index=0, value=1)
+    assert out[2].value == 3
+
+    failure = out[1]
+    assert isinstance(failure, AttemptFailure)
+    assert failure.kind is ATTEMPT_MISSING
+    assert failure.kind is AttemptFailure.MISSING
+    # source index and spec location are both recoverable
+    assert failure.index == 1
+    assert failure.path[-1] == 1
+    # original GlomError chain is preserved, not re-wrapped
+    assert isinstance(failure.error, PathAccessError)
+    assert isinstance(failure.error, GlomError)
+    assert isinstance(failure.error.exc, KeyError)
+    assert failure.error.path == Path(T['a'])
+
+
+def test_attempt_error_kind():
+    # non-GlomError exceptions from plain callables are captured, too
+    out = list(glom(['1', 'x', '3'], Iter().attempt(int)))
+    assert [r.ok for r in out] == [True, False, True]
+    assert out[1].kind is ATTEMPT_ERROR
+    assert isinstance(out[1].error, ValueError)
+
+    # a GlomError raised by the spec keeps its type
+    out = list(glom([{'a': 1}, {'a': 2}], Iter().attempt(T['b'])))
+    assert all(r.kind is ATTEMPT_MISSING for r in out)
+
+
+def test_attempt_skip_and_stop():
+    # SKIP/STOP returned by the subspec get their own failure kinds
+    spec = Iter().attempt(lambda t: SKIP if t == 1 else (STOP if t == 3 else t * 10))
+    out = list(glom([0, 1, 2, 3, 4], spec))
+
+    assert [r.ok for r in out] == [True, False, True, False]
+    assert out[1].kind is ATTEMPT_SKIP
+    assert out[1].error is None
+    assert out[3].kind is ATTEMPT_STOP
+    assert out[3].error is None
+    # STOP is terminal: element 4 was never processed
+    assert len(out) == 4
+
+    # SKIP/STOP source elements are still handled by Iter itself
+    assert list(glom([1, SKIP, 2], Iter().attempt())) == [
+        AttemptSuccess(0, 1), AttemptSuccess(1, 2)]
+    assert list(glom([1, STOP, 2], Iter().attempt())) == [AttemptSuccess(0, 1)]
+
+    # a custom Iter sentinel is also a terminal STOP outcome
+    spec = Iter(sentinel='END').attempt(lambda t: 'END' if t == 2 else t)
+    out = list(glom([0, 1, 2, 3], spec))
+    assert [r.ok for r in out] == [True, True, False]
+    assert out[2].kind is ATTEMPT_STOP
+
+
+def test_attempt_keep_values_and_budget():
+    # by default, failures do not retain the original value
+    out = list(glom(['x', 'y'], Iter().attempt(int)))
+    assert all(r.value is _MISSING for r in out)
+
+    # keep_values retains values up to the budget, then stops
+    spec = Iter().attempt(int, keep_values=True, value_budget=2)
+    out = list(glom(['1', 'x', 'y', 'z', '5'], spec))
+    failures = [r for r in out if not r.ok]
+    assert [f.value for f in failures] == ['x', 'y', _MISSING]
+    assert [r.value for r in out if r.ok] == [1, 5]
+
+    with pytest.raises(ValueError):
+        Iter().attempt(int, value_budget=-1)
+
+
+def test_attempt_callback_once_per_element():
+    calls = []
+
+    def boom(v):
+        calls.append(v)
+        if v == 2:
+            raise ValueError('nope')
+        return v
+
+    out = list(glom([1, 2, 3], Iter().attempt(boom)))
+    assert [r.ok for r in out] == [True, False, True]
+    # exactly one invocation per element, success or failure
+    assert calls == [1, 2, 3]
+
+
+def test_attempt_source_error_terminates():
+    # one-shot source: one good record, one bad record, then the
+    # source itself raises. The source error must terminate the
+    # stream, not surface as another failure item.
+    def source():
+        yield {'a': 1}
+        yield {'b': 2}
+        raise RuntimeError('source exploded')
+
+    out = glom(source(), Iter().attempt(T['a']))
+
+    good = next(out)
+    assert good == AttemptSuccess(index=0, value=1)
+
+    bad = next(out)
+    assert isinstance(bad, AttemptFailure)
+    assert bad.kind is ATTEMPT_MISSING
+    assert bad.index == 1
+    assert bad.path[-1] == 1
+    assert isinstance(bad.error, PathAccessError)
+
+    with pytest.raises(RuntimeError, match='source exploded'):
+        next(out)
+
+
+def test_attempt_close_cleans_up():
+    # closing the consumer early closes the internal iterator
+    closed = []
+
+    class Closeable(object):
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return 1
+
+        def close(self):
+            closed.append(True)
+
+    scope = {Path: [], glom: None}
+    stream = _attempt_iter(Closeable(), scope, T, False, 0)
+    next(stream)
+    stream.close()
+    assert closed == [True]
+
+    # a close() that raises propagates; it is not converted to None
+    class BadClose(object):
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return 1
+
+        def close(self):
+            raise RuntimeError('close boom')
+
+    stream = _attempt_iter(BadClose(), {Path: [], glom: None}, T, False, 0)
+    next(stream)
+    with pytest.raises(RuntimeError, match='close boom'):
+        stream.close()
+
+
+def test_attempt_composition():
+    # outcomes flow through downstream Iter ops for filtering,
+    # batching, and summarizing
+    out = list(glom([{'a': 1}, {}, {'a': 3}],
+                    Iter().attempt(T['a']).filter(lambda r: r.ok).map(lambda r: r.value)))
+    assert out == [1, 3]
+
+    out = list(glom([1, 'x', 2, 'y'], Iter().attempt(int).chunked(2)))
+    assert [[r.ok for r in chunk] for chunk in out] == [[True, False], [True, False]]
+
+    summary = {'ok': 0, 'failed': 0}
+    for r in glom([1, 'x', 2, 'y'], Iter().attempt(int)):
+        summary['ok' if r.ok else 'failed'] += 1
+    assert summary == {'ok': 2, 'failed': 2}
+
+    assert repr(Iter().attempt(int)) == 'Iter().attempt(int)'
+    assert (repr(Iter().attempt(int, keep_values=True, value_budget=2))
+            == 'Iter().attempt(subspec=int, keep_values=True, value_budget=2)')

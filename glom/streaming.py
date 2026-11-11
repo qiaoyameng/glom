@@ -20,9 +20,126 @@ except ImportError:
 
 from boltons.iterutils import split_iter, chunked_iter, windowed_iter, unique_iter, first
 from boltons.funcutils import FunctionBuilder
+from boltons.typeutils import make_sentinel
 
-from .core import glom, T, STOP, SKIP, _MISSING, Path, TargetRegistry, Call, Spec, Pipe, S, bbrepr, format_invocation
+from .core import (glom, T, STOP, SKIP, _MISSING, Path, TargetRegistry, Call,
+                   Spec, Pipe, S, GlomError, PathAccessError, bbrepr,
+                   format_invocation)
 from .matching import Check
+
+
+# outcome tags for :meth:`Iter.attempt()`; see :class:`AttemptFailure`
+ATTEMPT_MISSING = make_sentinel('ATTEMPT_MISSING')
+ATTEMPT_SKIP = make_sentinel('ATTEMPT_SKIP')
+ATTEMPT_STOP = make_sentinel('ATTEMPT_STOP')
+ATTEMPT_ERROR = make_sentinel('ATTEMPT_ERROR')
+
+_DEFAULT_ATTEMPT_VALUE_BUDGET = 10
+
+class AttemptSuccess:
+    """The success outcome yielded by :meth:`Iter.attempt()`.
+
+    Attributes:
+       index (int): Zero-based position of the source element in the
+         iterable being processed.
+       value: The result of applying the spec to the source element.
+
+    >>> glom(['1', '2'], Iter(int).attempt().all())
+    [AttemptSuccess(index=0, value=1), AttemptSuccess(index=1, value=2)]
+    """
+    __slots__ = ('index', 'value')
+
+    def __init__(self, index, value):
+        self.index = index
+        self.value = value
+
+    @property
+    def ok(self):
+        """Always ``True`` for :class:`AttemptSuccess`."""
+        return True
+
+    def __repr__(self):
+        return '%s(index=%r, value=%r)' % (self.__class__.__name__,
+                                           self.index, self.value)
+
+    def __eq__(self, other):
+        if type(other) is not AttemptSuccess:
+            return NotImplemented
+        return self.index == other.index and self.value == other.value
+
+    def __hash__(self):
+        return hash((self.__class__, self.index))
+
+
+class AttemptFailure:
+    """The failure outcome yielded by :meth:`Iter.attempt()`, produced
+    whenever a single source element does not yield a normal value.
+
+    Attributes:
+       index (int): Zero-based position of the source element in the
+         iterable being processed.
+       kind: One of the outcome sentinels describing why no value was
+         produced:
+
+         * :data:`ATTEMPT_MISSING` -- the spec raised a
+           :class:`~glom.PathAccessError` while looking up a value
+         * :data:`ATTEMPT_SKIP` -- the spec evaluated to
+           :data:`~glom.SKIP`
+         * :data:`ATTEMPT_STOP` -- the spec evaluated to
+           :data:`~glom.STOP` (or the configured sentinel)
+         * :data:`ATTEMPT_ERROR` -- the spec raised any other error
+       path: A copy of the glom target path at the point of failure,
+         including the source element's index.
+       error: The original exception raised while applying the spec,
+         kept intact with its full ``GlomError`` chain (including any
+         wrapped exception on its ``__wrapped`` attribute). ``None``
+         for the non-exceptional SKIP and STOP outcomes.
+       value: The original source element, or the :data:`~glom._MISSING`
+         sentinel when value retention is disabled or the configured
+         value budget has been spent.
+
+    Note that :class:`AttemptFailure` never swallows errors from the
+    source iterator itself: if fetching the next source element raises,
+    that error propagates out of the iteration instead.
+    """
+    __slots__ = ('index', 'kind', 'path', 'error', 'value')
+
+    # expose the outcome sentinels as class attributes for convenience
+    MISSING = ATTEMPT_MISSING
+    SKIP = ATTEMPT_SKIP
+    STOP = ATTEMPT_STOP
+    ERROR = ATTEMPT_ERROR
+
+    def __init__(self, index, kind, path, error, value=_MISSING):
+        self.index = index
+        self.kind = kind
+        self.path = path
+        self.error = error
+        self.value = value
+
+    @property
+    def ok(self):
+        """Always ``False`` for :class:`AttemptFailure`."""
+        return False
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        parts = ['index=%r' % self.index, 'kind=%r' % self.kind]
+        if self.error is not None:
+            parts.append('error=%r' % self.error)
+        if self.value is not _MISSING:
+            parts.append('value=%r' % self.value)
+        return '%s(%s)' % (cn, ', '.join(parts))
+
+    def __eq__(self, other):
+        if type(other) is not AttemptFailure:
+            return NotImplemented
+        return (self.index == other.index and self.kind is other.kind
+                and self.error == other.error and self.value == other.value)
+
+    def __hash__(self):
+        return hash((self.__class__, self.index, self.kind))
+
 
 class Iter:
     """``Iter()`` is glom's counterpart to Python's built-in :func:`iter()`
@@ -136,6 +253,86 @@ class Iter:
             (subspec,),
             lambda iterable, scope: imap(
                 lambda t: scope[glom](t, subspec, scope), iterable))
+
+    def attempt(self, subspec=T, keep_values=False, value_budget=_DEFAULT_ATTEMPT_VALUE_BUDGET):
+        """Return a new :class:`Iter()` spec which evaluates *subspec*
+        once per source element and always yields exactly one outcome
+        object, instead of letting the first bad element abort the
+        whole batch.
+
+        Successful elements come out as :class:`AttemptSuccess`
+        instances carrying the source index and the spec result;
+        anything else comes out as :class:`AttemptFailure`, tagged
+        with a ``kind`` sentinel:
+
+        * :data:`ATTEMPT_MISSING` -- a :class:`~glom.PathAccessError`
+          from the spec,
+        * :data:`ATTEMPT_ERROR` -- any other exception from the spec,
+          preserved on the failure as the original error with its full
+          ``GlomError`` chain,
+        * :data:`ATTEMPT_SKIP` and :data:`ATTEMPT_STOP` -- when the
+          spec returns the :data:`~glom.SKIP` or :data:`~glom.STOP`
+          sentinels, respectively. A STOP outcome is terminal, just
+          like plain :class:`Iter()` behavior.
+
+        >>> target = [{'a': 1}, {}, {'a': 3}]
+        >>> out = glom(target, Iter().attempt(T['a']).all())
+        >>> [(r.index, r.ok, r.value if r.ok else None) for r in out]
+        [(0, True, 1), (1, False, None), (2, True, 3)]
+        >>> out[1].kind is AttemptFailure.MISSING
+        True
+        >>> out[1].error  # doctest: +ELLIPSIS
+        PathAccessError(KeyError('a'), T['a'], 0)
+        >>> out[1].path  # doctest: +ELLIPSIS
+        [Iter().attempt(T['a']), 1]
+        >>> from glom.core import _MISSING
+        >>> out[1].value is _MISSING
+        True
+
+        Only errors raised while applying *subspec* to an element are
+        captured. Specs applied by earlier stages of the pipeline
+        (e.g. the :class:`Iter()` subspec or an earlier
+        :meth:`map()`) are outside this protection, and if the source
+        iterator itself raises while fetching the next element, that
+        error propagates and terminates the stream -- a broken source
+        is not another bad record:
+
+        >>> def source():
+        ...     yield {'a': 1}
+        ...     raise RuntimeError('source exploded')
+        >>> out = glom(source(), Iter().attempt(T['a']))
+        >>> next(out)
+        AttemptSuccess(index=0, value=1)
+        >>> next(out)
+        Traceback (most recent call last):
+        ...
+        RuntimeError: source exploded
+
+        Args:
+           subspec: A subspec to be applied on each element from the
+             iterable. Defaults to :data:`~glom.T`, i.e. the element
+             itself.
+           keep_values (bool): When true, failures retain a reference
+             to the original source element on
+             :attr:`AttemptFailure.value`. When false (the default),
+             the attribute holds the :data:`~glom._MISSING` sentinel,
+             so failing streams do not pin data in memory.
+           value_budget (int): Upper bound on how many failure values
+             are retained when *keep_values* is true, so a stream of
+             mostly-bad records cannot accumulate without limit. Once
+             the budget is spent, later failures omit their value.
+        """
+        if value_budget < 0:
+            raise ValueError('expected value_budget >= 0, got: %r' % value_budget)
+        args = (subspec,)
+        if keep_values or value_budget != _DEFAULT_ATTEMPT_VALUE_BUDGET:
+            # NB: with >1 args, __repr__ renders them all as kwargs
+            args = (subspec, keep_values, value_budget)
+        return self._add_op(
+            'attempt', args,
+            lambda iterable, scope: _attempt_iter(
+                iterable, scope, subspec, keep_values, value_budget,
+                self.sentinel))
 
     def filter(self, key=T):
         """Return a new :class:`Iter()` spec which will include only elements matching the
@@ -350,6 +547,79 @@ class Iter:
         spec returned from this method is not an :class:`Iter()` instance.
         """
         return (self, First(key=key, default=default))
+
+
+def _attempt_iter(iterable, scope, subspec, keep_values, value_budget,
+                  sentinel=STOP):
+    """Generator behind :meth:`Iter.attempt()`.
+
+    Wraps only the per-element spec evaluation in try/except; pulling
+    the next element from *iterable* happens outside the handler so a
+    source-iterator error propagates to the caller. When the consumer
+    closes the generator early, ``finally`` closes the wrapped
+    iterator instead of converting its shutdown signals into results.
+    """
+    iterator = iter(iterable)
+    retained = 0
+    base_path = scope[Path]
+    index = 0
+    try:
+        while True:
+            # outside the try: source failures must terminate, not
+            # get reported as another bad record
+            try:
+                element = next(iterator)
+            except StopIteration:
+                return
+
+            scope[Path] = base_path + [index]
+            try:
+                result = (element if subspec is T
+                          else scope[glom](element, subspec, scope))
+            except PathAccessError as error:
+                yield _make_failure(index, ATTEMPT_MISSING, scope, error,
+                                    element, keep_values, retained, value_budget)
+                retained += 1
+            except GlomError as error:
+                yield _make_failure(index, ATTEMPT_ERROR, scope, error,
+                                    element, keep_values, retained, value_budget)
+                retained += 1
+            except Exception as error:
+                # errors raised by plain callables are not wrapped
+                # until the top-level glom() call, so catch them here
+                # to keep one bad element from aborting the stream
+                yield _make_failure(index, ATTEMPT_ERROR, scope, error,
+                                    element, keep_values, retained, value_budget)
+                retained += 1
+            else:
+                if result is SKIP:
+                    yield _make_failure(index, ATTEMPT_SKIP, scope, None,
+                                        element, keep_values, retained,
+                                        value_budget)
+                    retained += 1
+                elif result is STOP or result is sentinel:
+                    # like plain Iter(), STOP is never let through
+                    yield _make_failure(index, ATTEMPT_STOP, scope, None,
+                                        element, keep_values, retained,
+                                        value_budget)
+                    retained += 1
+                    return
+                else:
+                    yield AttemptSuccess(index, result)
+            index += 1
+    finally:
+        # release the wrapped iterator's resources on early close;
+        # do not swallow any error it raises while shutting down
+        close = getattr(iterator, 'close', None)
+        if close is not None:
+            close()
+        scope[Path] = base_path
+
+
+def _make_failure(index, kind, scope, error, element,
+                  keep_values, retained, value_budget):
+    value = element if (keep_values and retained < value_budget) else _MISSING
+    return AttemptFailure(index, kind, list(scope[Path]), error, value)
 
 
 class First:

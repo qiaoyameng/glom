@@ -12,6 +12,18 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `Iter().attempt()`, a streaming spec which evaluates a subspec
+  once per element and yields an `AttemptSuccess` or `AttemptFailure`
+  outcome object instead of aborting the whole stream on the first
+  bad record. Failures carry the source index, the glom path at the
+  point of failure, a kind sentinel (`ATTEMPT_MISSING`,
+  `ATTEMPT_SKIP`, `ATTEMPT_STOP`, `ATTEMPT_ERROR`), and the original
+  `GlomError` chain. Retention of the original element is opt-in via
+  `keep_values` and bounded by `value_budget`. Errors raised by the
+  source iterator itself still terminate the stream.
+
 ## 25.12.0
 
 _(December 28, 2025)_

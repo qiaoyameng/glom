@@ -46,6 +46,12 @@ from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 # there's no -ion word that really fits what "streaming" means.
 # generation, production, iteration, all have more relevant meanings
 # elsewhere. (maybe procrastination :P)
-from glom.streaming import Iter
+from glom.streaming import (Iter,
+                            AttemptSuccess,
+                            AttemptFailure,
+                            ATTEMPT_MISSING,
+                            ATTEMPT_SKIP,
+                            ATTEMPT_STOP,
+                            ATTEMPT_ERROR)
 
 from glom._version import __version__
