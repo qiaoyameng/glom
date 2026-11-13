@@ -28,6 +28,7 @@ from glom.core import (glom,
                        T, S, A)
 
 from glom.reduction import Sum, Fold, Flatten, flatten, FoldError, Merge, merge
+from glom.spilling import SpillGroup
 from glom.matching import (M,
                            Or,
                            And,

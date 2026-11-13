@@ -12,6 +12,16 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `SpillGroup`, a bounded-memory variant of `Group` which spills
+  inactive group accumulator states to a local SQLite database once a
+  shared budget (`max_active`) is exceeded. Supports `Count`, `Sum`,
+  `Min`, and `Max` out of the box; custom aggregators participate via
+  explicit `encode_state()`/`decode_state()` (and optional
+  `finalize_state()`) methods. Spill files are cleaned up on
+  completion, early stop, error, or explicit `close()`.
+
 ## 25.12.0
 
 _(December 28, 2025)_
