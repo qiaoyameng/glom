@@ -47,6 +47,46 @@ and :class:`~glom.Optional`.
 
 .. autoclass:: glom.Required
 
+Named captures and backreferences
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A :class:`~glom.Capture` binds the current target to a name.  Reusing the
+same name later in the pattern requires the new value to compare equal,
+which makes it possible to express relationships such as a nested
+record's ``parent_id`` matching the outer record's ``id``::
+
+  >>> from glom import Match, Capture, CaptureRef
+  >>> target = {'id': 1, 'child': {'parent_id': 1}}
+  >>> spec = Match({
+  ...     'id': Capture('record_id'),
+  ...     'child': {'parent_id': CaptureRef('record_id')},
+  ... })
+  >>> result, bindings = spec.verify_with_captures(target)
+  >>> bindings
+  {'record_id': 1}
+
+Bindings are local to one top-level :func:`~glom.glom` call.  They are
+never stored on a capture rule or on the input data, so specs can be
+reused across calls and threads.  Use :class:`~glom.Captures` as a spec
+to get a snapshot of the bindings accumulated so far.
+
+Bindings from failed alternatives are discarded.  :class:`~glom.And`
+shares the bindings made by its successful children, :class:`~glom.Or`
+commits only the branch that succeeds, and :class:`~glom.Not` never
+publishes bindings made while testing its child.  Dictionary, list,
+tuple, :class:`~glom.Optional`, and :class:`~glom.Switch` matching follow
+the same transactional rules.
+
+.. autoclass:: glom.Capture
+
+.. autoclass:: glom.CaptureRef
+
+.. autoclass:: glom.Captures
+
+.. autoclass:: glom.MatchResult
+
+.. autoclass:: glom.UnboundCaptureError
+
 ``M`` Expressions
 ~~~~~~~~~~~~~~~~~
 

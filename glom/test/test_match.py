@@ -1,3 +1,4 @@
+import copy
 import re
 import json
 
@@ -6,7 +7,7 @@ import pytest
 from glom import glom, S, Val, T, A, Fill, Ref, Coalesce, STOP, Switch
 from glom.matching import (
     Match, M, MatchError, TypeMatchError, And, Or, Not,
-    Optional, Required, Regex)
+    Optional, Required, Regex, Capture, CaptureRef, Captures)
 from glom.core import Auto, SKIP, Ref
 
 try:
@@ -90,6 +91,126 @@ def test_match_expressions():
         glom(1, M < 1)
     with pytest.raises(MatchError):
         glom(1, M != 1)
+
+
+def test_capture_backreferences():
+    target = {'id': 1, 'child': {'parent_id': 1}}
+    spec = Match({
+        'id': Capture('parent_id'),
+        'child': {'parent_id': CaptureRef('parent_id')},
+    })
+
+    result, captures = spec.verify_with_captures(target)
+    assert result == target
+    assert captures == {'parent_id': 1}
+
+    same_name = Match({
+        'id': Capture('parent_id'),
+        'child': {'parent_id': Capture('parent_id')},
+    })
+    assert same_name.verify(target) == target
+
+    conflict = {'id': 1, 'child': {'parent_id': '1'}}
+    original = copy.deepcopy(conflict)
+    with pytest.raises(MatchError) as exc_info:
+        glom(conflict, spec)
+    message = str(exc_info.value)
+    assert "capture 'parent_id'" in message
+    assert "'1'" in message
+    assert conflict == original
+
+
+def test_capture_unbound_vs_none():
+    with pytest.raises(MatchError, match="not bound"):
+        glom(None, Match(CaptureRef('missing')))
+
+    bound_none = Match(And(Capture('none'), CaptureRef('none')))
+    assert glom(None, bound_none) is None
+
+
+def test_capture_branch_transactions():
+    and_spec = Match(And(
+        Capture('item_id', T['id']),
+        {'id': 1, 'child': {'parent_id': CaptureRef('item_id')}},
+    ))
+    assert and_spec.verify({
+        'id': 1, 'child': {'parent_id': 1}}) == {
+        'id': 1, 'child': {'parent_id': 1}}
+
+    or_spec = Match(Or(
+        {'id': Capture('id'), 'child': {'parent_id': Capture('id')}},
+        {'id': 1, 'child': {'parent_id': Capture('id')}},
+    ))
+    result, captures = or_spec.verify_with_captures({
+        'id': 1, 'child': {'parent_id': '1'}})
+    assert result['child']['parent_id'] == '1'
+    assert captures == {'id': '1'}
+
+    not_spec = Match(And(
+        Not(And(Capture('probe'), Match(2))),
+        Captures(),
+    ))
+    assert not_spec.verify(1) == {}
+    not_clean = Match(And(
+        Not(And(Capture('probe'), Match(2))),
+        CaptureRef('probe'),
+    ))
+    with pytest.raises(MatchError, match="not bound"):
+        not_clean.verify(1)
+
+    list_spec = Match(Or(
+        [{'id': Capture('id'), 'child': {'parent_id': Capture('id')}}],
+        [{'id': 1, 'child': {'parent_id': Capture('id')}}],
+    ))
+    result, captures = list_spec.verify_with_captures([
+        {'id': 1, 'child': {'parent_id': '1'}}])
+    assert result[0]['child']['parent_id'] == '1'
+    assert captures == {'id': '1'}
+
+    optional_spec = Match(Or(
+        {'id': Capture('id'), Optional('child'): {'parent_id': Capture('id')}},
+        {'id': 1, 'child': {'parent_id': Capture('id')}},
+    ))
+    result, captures = optional_spec.verify_with_captures({
+        'id': 1, 'child': {'parent_id': '1'}})
+    assert result['child']['parent_id'] == '1'
+    assert captures == {'id': '1'}
+
+    switch_spec = Match(Switch([
+        (And(Capture('left'), Match(2)), Val('wrong')),
+        (Capture('right'), CaptureRef('right')),
+    ]))
+    result, captures = switch_spec.verify_with_captures(1)
+    assert result == 1
+    assert captures == {'right': 1}
+
+
+def test_capture_spec_reuse_and_concurrency():
+    def make_spec():
+        return Match({
+            'id': Capture('id'),
+            'child': {'parent_id': CaptureRef('id')},
+        })
+
+    spec = make_spec()
+    for value in (1, 2, 3):
+        result, captures = spec.verify_with_captures({
+            'id': value, 'child': {'parent_id': value}})
+        assert result['id'] == value
+        assert captures == {'id': value}
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    spec = make_spec()
+
+    def check(value):
+        result, captures = spec.verify_with_captures({
+            'id': value, 'child': {'parent_id': value}})
+        return result['id'], captures['id']
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(check, range(20)))
+    assert results == [(value, value) for value in range(20)]
 
 
 def test_defaults():

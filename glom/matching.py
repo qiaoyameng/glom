@@ -14,10 +14,201 @@ from pprint import pprint
 from boltons.iterutils import is_iterable
 from boltons.typeutils import make_sentinel
 
-from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation, Path, chain_child, Val, arg_val
+from .core import (GlomError, glom, T, MODE, ROOT, bbrepr, bbformat,
+                   format_invocation, Path, chain_child, Val, arg_val)
 
 
 _MISSING = make_sentinel('_MISSING')
+_CAPTURE_STATE = make_sentinel('_CAPTURE_STATE')
+_UNBOUND = make_sentinel('_UNBOUND')
+
+
+class _CaptureState:
+    """Per-glom-invocation storage for named capture bindings.
+
+    The undo log makes capture changes transactional.  A branch can
+    snapshot the log, try a match, and roll back only its own changes
+    without copying the whole binding map.
+    """
+
+    __slots__ = ('bindings', '_undo')
+
+    def __init__(self):
+        self.bindings = {}
+        self._undo = []
+
+    def mark(self):
+        return len(self._undo)
+
+    def rollback(self, mark):
+        while len(self._undo) > mark:
+            name, had_value, old_value = self._undo.pop()
+            if had_value:
+                self.bindings[name] = old_value
+            else:
+                del self.bindings[name]
+
+    def get(self, name):
+        return self.bindings.get(name, _UNBOUND)
+
+    def bind(self, name, value):
+        had_value = name in self.bindings
+        self._undo.append((name, had_value,
+                           self.bindings.get(name, _MISSING)))
+        self.bindings[name] = value
+        return value
+
+    def snapshot(self):
+        return dict(self.bindings)
+
+
+def _get_capture_state(scope):
+    """Get the capture state for the current top-level glom call.
+
+    Keeping the state on ``ROOT``, rather than on any spec object, means
+    that a Match spec can safely be reused by sequential and concurrent
+    glom calls.
+    """
+    try:
+        return scope[_CAPTURE_STATE]
+    except KeyError:
+        state = _CaptureState()
+        scope[ROOT][_CAPTURE_STATE] = state
+        return state
+
+
+def _values_equal(left, right):
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+class Capture:
+    """Bind the current target, or the result of *subspec*, to *name*.
+
+    A repeated capture with the same name is a backreference: the new
+    value must compare equal to the value bound earlier in the same
+    successful match.  Bindings live only for the duration of one
+    top-level :func:`~glom.glom` call.
+    """
+
+    __slots__ = ('name', 'subspec')
+
+    def __init__(self, name, subspec=_MISSING):
+        hash(name)
+        self.name, self.subspec = name, subspec
+
+    def glomit(self, target, scope):
+        state = _get_capture_state(scope)
+        mark = state.mark()
+        try:
+            value = target
+            if self.subspec is not _MISSING:
+                value = scope[glom](target, self.subspec, scope)
+            old_value = state.get(self.name)
+            if old_value is not _UNBOUND and not _values_equal(old_value, value):
+                raise MatchError(
+                    "capture {0!r} was {1!r}, but target was {2!r}",
+                    self.name, old_value, value)
+            if old_value is _UNBOUND:
+                state.bind(self.name, value)
+            return value
+        except Exception:
+            state.rollback(mark)
+            raise
+
+    def __repr__(self):
+        args = bbrepr(self.name)
+        if self.subspec is not _MISSING:
+            args += ', ' + bbrepr(self.subspec)
+        return f"{self.__class__.__name__}({args})"
+
+
+class CaptureRef:
+    """Match only if the target equals a value captured earlier by name.
+
+    An unbound reference raises ``MatchError``; this is deliberately
+    distinct from a capture whose value is ``None``.
+    """
+
+    __slots__ = ('name',)
+
+    def __init__(self, name):
+        hash(name)
+        self.name = name
+
+    def glomit(self, target, scope):
+        state = _get_capture_state(scope)
+        value = state.get(self.name)
+        if value is _UNBOUND:
+            raise UnboundCaptureError("capture {0!r} is not bound", self.name)
+        if not _values_equal(value, target):
+            raise MatchError(
+                "capture {0!r} was {1!r}, but target was {2!r}",
+                self.name, value, target)
+        return target
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({bbrepr(self.name)})"
+
+
+Captured = CaptureRef
+CaptureReference = CaptureRef
+
+
+class Captures:
+    """Return a snapshot of the successful bindings accumulated so far."""
+
+    __slots__ = ()
+
+    def glomit(self, target, scope):
+        return _get_capture_state(scope).snapshot()
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class MatchResult(tuple):
+    """A ``(result, bindings)`` pair returned by
+    :meth:`Match.verify_with_captures`.
+
+    It remains tuple-compatible while also exposing the two values as
+    attributes.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, result, bindings):
+        return tuple.__new__(cls, (result, bindings))
+
+    @property
+    def result(self):
+        return self[0]
+
+    @property
+    def bindings(self):
+        return self[1]
+
+    @property
+    def captures(self):
+        return self[1]
+
+
+class _MatchBindings:
+    """Internal wrapper returning a match result and its bindings."""
+
+    __slots__ = ('matcher',)
+
+    def __init__(self, matcher):
+        self.matcher = matcher
+
+    def glomit(self, target, scope):
+        state = _get_capture_state(scope)
+        result = scope[glom](target, self.matcher, scope)
+        return MatchResult(result, state.snapshot())
 
 
 # NOTE: it is important that MatchErrors be cheap to construct,
@@ -40,6 +231,10 @@ class MatchError(GlomError):
     def get_message(self):
         fmt, args = self.args[0], self.args[1:]
         return bbformat(fmt, *args)
+
+
+class UnboundCaptureError(MatchError):
+    """Raised when a :class:`CaptureRef` name has no binding."""
 
 
 class TypeMatchError(MatchError, TypeError):
@@ -146,14 +341,19 @@ class Match:
         self.default = default
 
     def glomit(self, target, scope):
+        state = _get_capture_state(scope)
+        mark = state.mark()
         scope[MODE] = _glom_match
         try:
-            ret = scope[glom](target, self.spec, scope)
+            return scope[glom](target, self.spec, scope)
         except GlomError:
+            state.rollback(mark)
             if self.default is _MISSING:
                 raise
-            ret = arg_val(target, self.default, scope)
-        return ret
+            return arg_val(target, self.default, scope)
+        except Exception:
+            state.rollback(mark)
+            raise
 
     def verify(self, target):
         """A convenience function a :class:`Match` instance which returns the
@@ -168,6 +368,18 @@ class Match:
 
         """
         return glom(target, self)
+
+    def verify_with_captures(self, target):
+        """Return ``(matched_value, bindings)`` for a successful match.
+
+        ``bindings`` is a fresh dictionary snapshot for this call only,
+        so the same Match instance can be reused safely.
+        """
+        return glom(target, _MatchBindings(self))
+
+    def bind(self, target):
+        """Alias for :meth:`verify_with_captures`."""
+        return self.verify_with_captures(target)
 
     def matches(self, target):
         """A convenience method on a :class:`Match` instance, returns
@@ -280,11 +492,17 @@ class _Bool:
         return Not(self)
 
     def glomit(self, target, scope):
+        state = _get_capture_state(scope)
+        mark = state.mark()
         try:
             return self._glomit(target, scope)
         except GlomError:
+            state.rollback(mark)
             if self.default is not _MISSING:
                 return arg_val(target, self.default, scope)
+            raise
+        except Exception:
+            state.rollback(mark)
             raise
 
     def _m_repr(self):
@@ -314,10 +532,15 @@ class And(_Bool):
     __slots__ = ('children',)
 
     def _glomit(self, target, scope):
-        # all children must match without exception
+        state = _get_capture_state(scope)
+        mark = state.mark()
         result = target  # so that And() == True, similar to all([]) == True
-        for child in self.children:
-            result = scope[glom](target, child, scope)
+        try:
+            for child in self.children:
+                result = scope[glom](target, child, scope)
+        except Exception:
+            state.rollback(mark)
+            raise
         return result
 
     def __and__(self, other):
@@ -335,12 +558,19 @@ class Or(_Bool):
     __slots__ = ('children',)
 
     def _glomit(self, target, scope):
+        state = _get_capture_state(scope)
         for child in self.children[:-1]:
+            mark = state.mark()
             try:  # one child must match without exception
                 return scope[glom](target, child, scope)
             except GlomError:
-                pass
-        return scope[glom](target, self.children[-1], scope)
+                state.rollback(mark)
+        mark = state.mark()
+        try:
+            return scope[glom](target, self.children[-1], scope)
+        except GlomError:
+            state.rollback(mark)
+            raise
 
     def __or__(self, other):
         # reduce number of layers of spec
@@ -361,12 +591,16 @@ class Not(_Bool):
         self.child = child
 
     def glomit(self, target, scope):
+        state = _get_capture_state(scope)
+        mark = state.mark()
         try:  # one child must match without exception
             scope[glom](target, self.child, scope)
         except GlomError:
             return target
         else:
             raise GlomError("child shouldn't have passed", self.child)
+        finally:
+            state.rollback(mark)
 
     def _m_repr(self):
         if isinstance(self.child, (_MType, _MExpr)):
@@ -415,10 +649,16 @@ class _MSubspec:
         return f'M({bbrepr(self.spec)})'
 
     def glomit(self, target, scope):
-        match = scope[glom](target, self.spec, scope)
-        if match:
-            return target
-        raise MatchError('expected truthy value from {0!r}, got {1!r}', self.spec, match)
+        state = _get_capture_state(scope)
+        mark = state.mark()
+        try:
+            match = scope[glom](target, self.spec, scope)
+            if match:
+                return target
+            raise MatchError('expected truthy value from {0!r}, got {1!r}', self.spec, match)
+        except Exception:
+            state.rollback(mark)
+            raise
 
 
 class _MExpr:
@@ -439,26 +679,32 @@ class _MExpr:
         return Not(self)
 
     def glomit(self, target, scope):
-        lhs, op, rhs = self.lhs, self.op, self.rhs
-        if lhs is M:
-            lhs = target
-        if rhs is M:
-            rhs = target
-        if type(lhs) is _MSubspec:
-            lhs = scope[glom](target, lhs.spec, scope)
-        if type(rhs) is _MSubspec:
-            rhs = scope[glom](target, rhs.spec, scope)
-        matched = (
-            (op == '=' and lhs == rhs) or
-            (op == '!' and lhs != rhs) or
-            (op == '>' and lhs > rhs) or
-            (op == '<' and lhs < rhs) or
-            (op == 'g' and lhs >= rhs) or
-            (op == 'l' and lhs <= rhs)
-        )
-        if matched:
-            return target
-        raise MatchError("{0!r} {1} {2!r}", lhs, _M_OP_MAP.get(op, op), rhs)
+        state = _get_capture_state(scope)
+        mark = state.mark()
+        try:
+            lhs, op, rhs = self.lhs, self.op, self.rhs
+            if lhs is M:
+                lhs = target
+            if rhs is M:
+                rhs = target
+            if type(lhs) is _MSubspec:
+                lhs = scope[glom](target, lhs.spec, scope)
+            if type(rhs) is _MSubspec:
+                rhs = scope[glom](target, rhs.spec, scope)
+            matched = (
+                (op == '=' and lhs == rhs) or
+                (op == '!' and lhs != rhs) or
+                (op == '>' and lhs > rhs) or
+                (op == '<' and lhs < rhs) or
+                (op == 'g' and lhs >= rhs) or
+                (op == 'l' and lhs <= rhs)
+            )
+            if matched:
+                return target
+            raise MatchError("{0!r} {1} {2!r}", lhs, _M_OP_MAP.get(op, op), rhs)
+        except Exception:
+            state.rollback(mark)
+            raise
 
     def __repr__(self):
         op = _M_OP_MAP.get(self.op, self.op)
@@ -678,38 +924,51 @@ def _handle_dict(target, spec, scope):
     if not isinstance(target, dict):
         raise TypeMatchError(type(target), dict)
     spec_keys = spec  # cheating a little bit here, list-vs-dict, but saves an object copy sometimes
+    state = _get_capture_state(scope)
+    mark = state.mark()
 
-    required = {
-        key for key in spec_keys
-        if _precedence(key) == 0 and type(key) is not Optional
-        or type(key) is Required}
-    defaults = {  # pre-load result with defaults
-        key.key: key.default for key in spec_keys
-        if type(key) is Optional and key.default is not _MISSING}
-    result = {}
-    for key, val in target.items():
-        for maybe_spec_key in spec_keys:
-            # handle Required as a special case here rather than letting it be a stand-alone spec
-            if type(maybe_spec_key) is Required:
-                spec_key = maybe_spec_key.key
-            else:
-                spec_key = maybe_spec_key
-            try:
-                key = scope[glom](key, spec_key, scope)
-            except GlomError:
-                pass
-            else:
-                result[key] = scope[glom](val, spec[maybe_spec_key], chain_child(scope))
+    try:
+        required = {
+            key for key in spec_keys
+            if _precedence(key) == 0 and type(key) is not Optional
+            or type(key) is Required}
+        defaults = {  # pre-load result with defaults
+            key.key: key.default for key in spec_keys
+            if type(key) is Optional and key.default is not _MISSING}
+        result = {}
+        for target_key, val in target.items():
+            for maybe_spec_key in spec_keys:
+                # handle Required as a special case here rather than letting it be a stand-alone spec
+                if type(maybe_spec_key) is Required:
+                    spec_key = maybe_spec_key.key
+                else:
+                    spec_key = maybe_spec_key
+                key_mark = state.mark()
+                try:
+                    result_key = scope[glom](target_key, spec_key, scope)
+                except GlomError:
+                    state.rollback(key_mark)
+                    continue
+                try:
+                    result[result_key] = scope[glom](val, spec[maybe_spec_key],
+                                                     chain_child(scope))
+                except Exception:
+                    state.rollback(key_mark)
+                    raise
                 required.discard(maybe_spec_key)
                 break
-        else:
-            raise MatchError("key {0!r} didn't match any of {1!r}", key, spec_keys)
-    for key in set(defaults) - set(result):
-        result[key] = arg_val(target, defaults[key], scope)
-    if required:
-        raise MatchError("target missing expected keys: {0}", ', '.join([bbrepr(r) for r in required]))
-    return result
-
+            else:
+                raise MatchError("key {0!r} didn't match any of {1!r}",
+                                 target_key, spec_keys)
+        for key in set(defaults) - set(result):
+            result[key] = arg_val(target, defaults[key], scope)
+        if required:
+            raise MatchError("target missing expected keys: {0}",
+                             ', '.join([bbrepr(r) for r in required]))
+        return result
+    except Exception:
+        state.rollback(mark)
+        raise
 
 def _glom_match(target, spec, scope):
     if isinstance(spec, type):
@@ -720,33 +979,48 @@ def _glom_match(target, spec, scope):
     elif isinstance(spec, (list, set, frozenset)):
         if not isinstance(target, type(spec)):
             raise TypeMatchError(type(target), type(spec))
-        result = []
-        for item in target:
-            for child in spec:
-                try:
-                    result.append(scope[glom](item, child, scope))
-                    break
-                except GlomError as e:
-                    last_error = e
-            else:  # did not break, something went wrong
-                if target and not spec:
-                    raise MatchError(
-                        "{0!r} does not match empty {1}", target, type(spec).__name__)
-                # NOTE: unless error happens above, break will skip else branch
-                # so last_error will have been assigned
-                raise last_error
-        if type(spec) is not list:
-            return type(spec)(result)
-        return result
+        state = _get_capture_state(scope)
+        mark = state.mark()
+        try:
+            result = []
+            for item in target:
+                for child in spec:
+                    child_mark = state.mark()
+                    try:
+                        result.append(scope[glom](item, child, scope))
+                        break
+                    except GlomError as e:
+                        state.rollback(child_mark)
+                        last_error = e
+                else:  # did not break, something went wrong
+                    if target and not spec:
+                        raise MatchError(
+                            "{0!r} does not match empty {1}",
+                            target, type(spec).__name__)
+                    # NOTE: unless error happens above, break will skip else branch
+                    # so last_error will have been assigned
+                    raise last_error
+            if type(spec) is not list:
+                return type(spec)(result)
+            return result
+        except Exception:
+            state.rollback(mark)
+            raise
     elif isinstance(spec, tuple):
         if not isinstance(target, tuple):
             raise TypeMatchError(type(target), tuple)
-        if len(target) != len(spec):
-            raise MatchError("{0!r} does not match {1!r}", target, spec)
-        result = []
-        for sub_target, sub_spec in zip(target, spec):
-            result.append(scope[glom](sub_target, sub_spec, scope))
-        return tuple(result)
+        state = _get_capture_state(scope)
+        mark = state.mark()
+        try:
+            if len(target) != len(spec):
+                raise MatchError("{0!r} does not match {1!r}", target, spec)
+            result = []
+            for sub_target, sub_spec in zip(target, spec):
+                result.append(scope[glom](sub_target, sub_spec, scope))
+            return tuple(result)
+        except Exception:
+            state.rollback(mark)
+            raise
     elif callable(spec):
         try:
             if spec(target):
@@ -846,15 +1120,27 @@ class Switch:
 
 
     def glomit(self, target, scope):
-        for keyspec, valspec in self.cases:
-            try:
-                scope[glom](target, keyspec, scope)
-            except GlomError as ge:
-                continue
-            return scope[glom](target, valspec, chain_child(scope))
-        if self.default is not _MISSING:
-            return arg_val(target, self.default, scope)
-        raise MatchError("no matches for target in %s"  % self.__class__.__name__)
+        state = _get_capture_state(scope)
+        mark = state.mark()
+        try:
+            for keyspec, valspec in self.cases:
+                key_mark = state.mark()
+                try:
+                    scope[glom](target, keyspec, scope)
+                except GlomError as ge:
+                    state.rollback(key_mark)
+                    continue
+                try:
+                    return scope[glom](target, valspec, chain_child(scope))
+                except Exception:
+                    state.rollback(mark)
+                    raise
+            if self.default is not _MISSING:
+                return arg_val(target, self.default, scope)
+            raise MatchError("no matches for target in %s"  % self.__class__.__name__)
+        except Exception:
+            state.rollback(mark)
+            raise
 
     def __repr__(self):
         return f'{self.__class__.__name__}({bbrepr(self.cases)})'
