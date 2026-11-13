@@ -503,6 +503,34 @@ def test_all_public_errors():
 
     _test_exc(TypeMatchError, 1, Match(str))
 
+    constructor_results = []
+
+    def _test_constructor_exc(exc_type, func):
+        with pytest.raises(exc_type) as exc_info:
+            func()
+        constructor_results.append(exc_info.value)
+        return exc_info.value
+
+    _test_constructor_exc(
+        glom.BidiSpecError,
+        lambda: glom.BidiSpec({'x': 'a'}, unmapped='invalid'))
+    _test_constructor_exc(
+        glom.NotInvertibleError,
+        lambda: glom.BidiSpec({'x': lambda target: target}))
+    _test_constructor_exc(
+        glom.DuplicateSourceError,
+        lambda: glom.BidiSpec({'x': 'a', 'y': 'a'}))
+    _test_constructor_exc(
+        glom.ParentChildConflictError,
+        lambda: glom.BidiSpec({'x': 'a', 'y': 'a.b'}))
+    _test_constructor_exc(
+        glom.SequenceConflictError,
+        lambda: glom.BidiSpec({'x': glom.Path('a', 0),
+                               'y': glom.Path('a', 2)}))
+    _test_constructor_exc(
+        glom.UnmappedFieldError,
+        lambda: glom.BidiSpec({'x': 'a'}).forward({'a': 1, 'b': 2}))
+
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc
         exc_str = str(exc)
@@ -513,7 +541,13 @@ def test_all_public_errors():
         assert bbrepr(target)[:80] in exc_str
         assert bbrepr(spec)[:80] in exc_str
 
+    for exc in constructor_results:
+        assert copy.copy(exc) is not exc
+        assert str(exc)
+        assert bbrepr(exc).startswith(exc.__class__.__name__)
+
     tested_types = [type(exc) for _, _, exc in results]
+    tested_types.extend(type(exc) for exc in constructor_results)
     untested_types = set(err_types) - set(tested_types)
 
     assert not untested_types, "did not test all public exception types"

@@ -12,6 +12,13 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+* Add `BidiSpec`, a restricted bidirectional mapping object for
+  invertible field-path, object-assembly, and fixed-sequence specs.
+  Non-invertible constructs are rejected at construction time, and
+  unmapped fields can be rejected or preserved in a sidecar.
+
 ## 25.12.0
 
 _(December 28, 2025)_

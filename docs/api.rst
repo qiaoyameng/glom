@@ -52,6 +52,47 @@ types that can be used with the basic set of Python builtins.
 .. autoclass:: glom.Val
 .. autoclass:: glom.Spec
 
+.. _bidi-spec:
+
+Invertible Specs with BidiSpec
+------------------------------
+
+When a spec only renames fields and rearranges them into a fixed
+structure, :class:`~glom.BidiSpec` can run it in both directions. It is
+deliberately independent of normal glom mode: only explicit paths,
+dictionary assembly, and fixed-position list/tuple assembly are
+accepted. Functions, defaults, filters, wildcards, and one-to-many
+iteration are rejected at construction time rather than being given an
+unsafe inverse.
+
+.. code-block:: python
+
+   >>> from glom import BidiSpec, Path
+   >>> target = {'user': {'name': 'Ada'}, 'payload': {'a.b': 3}}
+   >>> spec = BidiSpec({'name': 'user.name', 'dotted': Path('payload', 'a.b')})
+   >>> output = spec.forward(target)
+   >>> output
+   {'name': 'Ada', 'dotted': 3}
+   >>> spec.inverse(output) == target
+   True
+
+Fields outside the mapping are rejected by default. Pass
+``unmapped='sidecar'`` and request the sidecar explicitly to preserve
+them for the inverse:
+
+.. code-block:: python
+
+   >>> spec = BidiSpec({'name': 'user.name'}, unmapped='sidecar')
+   >>> output, sidecar = spec.forward(
+   ...     {'user': {'name': 'Ada', 'age': 36}}, with_sidecar=True)
+   >>> spec.inverse(output, sidecar=sidecar)
+   {'user': {'name': 'Ada', 'age': 36}}
+
+.. autoclass:: glom.BidiSpec
+   :members:
+
+.. autoclass:: glom.BidiSidecar
+
 .. _advanced-specifiers:
 
 .. seealso::
