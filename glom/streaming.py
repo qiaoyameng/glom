@@ -9,6 +9,7 @@ glom's streaming functionality revolves around a single :class:`Iter`
 Specifier type, which has methods to transform the target stream.
 """
 
+import sys
 from itertools import islice, dropwhile, takewhile, chain
 from functools import partial
 try:
@@ -21,8 +22,283 @@ except ImportError:
 from boltons.iterutils import split_iter, chunked_iter, windowed_iter, unique_iter, first
 from boltons.funcutils import FunctionBuilder
 
-from .core import glom, T, STOP, SKIP, _MISSING, Path, TargetRegistry, Call, Spec, Pipe, S, bbrepr, format_invocation
+from .core import (glom, T, STOP, SKIP, _MISSING, Path, PathAccessError,
+                   GlomError,
+                   TargetRegistry, Call, Spec, Pipe, S, bbrepr,
+                   format_invocation)
 from .matching import Check
+
+
+def _close_iterator(iterator):
+    close = getattr(iterator, 'close', None)
+    if close is not None:
+        close()
+
+
+def _error_chain(err):
+    """Return the exception and all wrapped/caused exceptions in order."""
+    chain = []
+    seen = set()
+    while err is not None and id(err) not in seen:
+        seen.add(id(err))
+        chain.append(err)
+        wrapped = getattr(err, '_GlomError__wrapped', None)
+        if wrapped is None:
+            wrapped = getattr(err, '__wrapped', None)
+        err = wrapped or getattr(err, '__cause__', None) or getattr(err, '__context__', None)
+    return tuple(chain)
+
+
+def _approx_size(value, limit=None):
+    """Estimate an object's shallow recursive size, stopping at *limit*."""
+    total = 0
+    stack = [value]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        try:
+            total += sys.getsizeof(cur)
+        except Exception:
+            total += 1
+        if limit is not None and total > limit:
+            return total
+        if isinstance(cur, dict):
+            stack.extend(cur.keys())
+            stack.extend(cur.values())
+        elif isinstance(cur, (list, tuple, set, frozenset)):
+            stack.extend(cur)
+    return total
+
+
+def _iter_error_path(error, item_path):
+    path = getattr(error, 'path', None)
+    if isinstance(path, Path):
+        parts = list(item_path.values())
+        for op, value in path.items():
+            if op not in ('.', 'P', '['):
+                break
+            if isinstance(value, (str, int, float, bool, type(None))):
+                parts.append(value)
+            else:
+                break
+        return Path(*parts)
+    return item_path
+
+
+def _path_for_item(base_path, index):
+    # The root scope often carries the current Iter spec in its Path.
+    # Keep enclosing indexes, but leave the spec object out of data
+    # locations reported for individual records.
+    parts = [part for part in base_path if not isinstance(part, Iter)]
+    parts.append(index)
+    return Path(*parts)
+
+
+class IterFailure:
+    """The failure item yielded by :meth:`Iter.attempt`.
+
+    It keeps the source index, the spec location, and the original
+    glom error chain without interrupting the rest of the stream.
+    """
+    __slots__ = ('index', 'path', 'item_path', 'kind', 'error', '_original',
+                 'error_chain', 'original_size', 'original_omitted')
+
+    def __init__(self, index, path, kind, error=None, original=_MISSING,
+                 error_chain=(), original_size=None, original_omitted=False,
+                 item_path=None):
+        self.index = index
+        self.path = path
+        self.item_path = item_path if item_path is not None else path
+        self.kind = kind
+        self.error = error
+        self._original = original
+        self.error_chain = tuple(error_chain)
+        self.original_size = original_size
+        self.original_omitted = original_omitted
+
+    @property
+    def source_index(self):
+        return self.index
+
+    @property
+    def status(self):
+        return self.kind
+
+    @property
+    def reason(self):
+        return self.kind
+
+    @property
+    def exception(self):
+        return self.error
+
+    @property
+    def exc(self):
+        return self.error
+
+    @property
+    def root_error(self):
+        return self.error_chain[-1] if self.error_chain else self.error
+
+    @property
+    def errors(self):
+        return self.error_chain
+
+    @property
+    def original_error(self):
+        return self.root_error
+
+    @property
+    def cause(self):
+        return self.root_error
+
+    @property
+    def error_type(self):
+        return type(self.error) if self.error is not None else None
+
+    @property
+    def spec_path(self):
+        path = getattr(self.error, 'path', None)
+        if isinstance(path, Path):
+            parts = []
+            for op, value in path.items():
+                if op not in ('.', 'P', '['):
+                    break
+                if isinstance(value, (str, int, float, bool, type(None))):
+                    parts.append(value)
+                else:
+                    break
+            return Path(*parts)
+        return self.path
+
+    @property
+    def location(self):
+        return self.path
+
+    @property
+    def original_value(self):
+        return self.original
+
+    @property
+    def original(self):
+        return None if self._original is _MISSING else self._original
+
+    @property
+    def source(self):
+        return self.original
+
+    @property
+    def value(self):
+        return self.original
+
+    @property
+    def has_original(self):
+        return self._original is not _MISSING
+
+    @property
+    def ok(self):
+        return False
+
+    @property
+    def success(self):
+        return False
+
+    @property
+    def failed(self):
+        return True
+
+    @property
+    def is_failure(self):
+        return True
+
+    @property
+    def is_missing(self):
+        return self.kind == 'missing'
+
+    @property
+    def is_skip(self):
+        return self.kind == 'skip'
+
+    @property
+    def is_stop(self):
+        return self.kind == 'stop'
+
+    @property
+    def is_error(self):
+        return self.kind == 'error'
+
+    def as_dict(self):
+        return {
+            'index': self.index,
+            'path': self.path,
+            'item_path': self.item_path,
+            'kind': self.kind,
+            'error': self.error,
+            'error_chain': self.error_chain,
+            'original': self.original,
+            'original_size': self.original_size,
+            'original_omitted': self.original_omitted,
+        }
+
+    def __getitem__(self, key):
+        try:
+            return self.as_dict()[key]
+        except KeyError:
+            raise KeyError(key) from None
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(index={self.index!r}, '
+                f'path={self.path!r}, kind={self.kind!r}, '
+                f'error={self.error!r})')
+
+
+AttemptFailure = IterFailure
+IterAttemptFailure = IterFailure
+IterError = IterFailure
+Failure = IterFailure
+Attempt = IterFailure
+AttemptItem = IterFailure
+
+
+class _CloseableIterator:
+    """Close the whole internal iterator chain when the consumer stops."""
+
+    __slots__ = ('_iterator', '_upstream', '_closed')
+
+    def __init__(self, iterator, upstream):
+        self._iterator = iterator
+        self._upstream = upstream
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._iterator)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            _close_iterator(self._iterator)
+        finally:
+            if self._upstream is not self._iterator:
+                _close_iterator(self._upstream)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def __del__(self):
+        self.close()
+
 
 class Iter:
     """``Iter()`` is glom's counterpart to Python's built-in :func:`iter()`
@@ -53,13 +329,35 @@ class Iter:
        sentinel: Keyword-only argument, which, when found in the
          iterable stream, causes the iteration to stop. Same as with the
          built-in :func:`iter`.
+       attempt: When true, apply *subspec* through :meth:`attempt`,
+         yielding :class:`IterFailure` items instead of raising for
+         per-record spec failures.
 
     """
     def __init__(self, subspec=T, **kwargs):
         self.subspec = subspec
         self._iter_stack = kwargs.pop('_iter_stack', [])
+        self._attempt = kwargs.pop('_attempt', None)
 
         self.sentinel = kwargs.pop('sentinel', STOP)
+        attempt_opts = {
+            'keep_original': kwargs.pop('keep_original', False),
+            'original_budget': kwargs.pop('original_budget', None),
+            'max_original_items': kwargs.pop('max_original_items', None),
+        }
+        if attempt_opts['original_budget'] is None:
+            attempt_opts['original_budget'] = kwargs.pop('max_original_bytes', None)
+        attempt = kwargs.pop('attempt', _MISSING)
+        if self._attempt is None:
+            if attempt is not _MISSING:
+                if attempt is True:
+                    self._set_attempt(**attempt_opts)
+                elif attempt is not False:
+                    self.subspec = attempt
+                    self._set_attempt(**attempt_opts)
+            elif any(value is not None and value is not False
+                     for value in attempt_opts.values()):
+                self._set_attempt(**attempt_opts)
         if kwargs:
             raise TypeError('unexpected keyword arguments: %r' % sorted(kwargs))
         return
@@ -80,15 +378,21 @@ class Iter:
             if len(args) > 1 and arg_names:
                 args, kwargs = (), zip(arg_names, args)
             chunks.append('.' + format_invocation(fname, args, kwargs, repr=bbrepr))
+        if self._attempt is not None:
+            attempt_args = ()
+            if self._attempt['subspec'] != self.subspec:
+                attempt_args = (self._attempt['subspec'],)
+            chunks.append('.' + format_invocation('attempt', attempt_args, repr=bbrepr))
         return ''.join(chunks)
 
     def glomit(self, target, scope):
-        iterator = self._iterate(target, scope)
+        base_iterator = self._iterate(target, scope)
+        iterator = base_iterator
 
         for _, _, callback in reversed(self._iter_stack):
             iterator = callback(iterator, scope)
 
-        return iter(iterator)
+        return _CloseableIterator(iterator, base_iterator)
 
     def _iterate(self, target, scope):
         iterate = scope[TargetRegistry].get_handler('iterate', target, path=scope[Path])
@@ -99,21 +403,137 @@ class Iter:
                             % (target.__class__.__name__, Path(*scope[Path]), e))
 
         base_path = scope[Path]
-        for i, t in enumerate(iterator):
-            scope[Path] = base_path + [i]
-            yld = (t if self.subspec is T else scope[glom](t, self.subspec, scope))
-            if yld is SKIP:
-                continue
-            elif yld is self.sentinel or yld is STOP:
-                # NB: sentinel defaults to STOP so I was torn whether
-                # to also check for STOP, and landed on the side of
-                # never letting STOP through.
-                return
-            yield yld
+        original_budget = None
+        original_items = 0
+        if self._attempt is not None:
+            original_budget = self._attempt['original_budget']
+            original_items = self._attempt['max_original_items']
+        try:
+            i = -1
+            while True:
+                try:
+                    t = next(iterator)
+                except StopIteration:
+                    break
+                i += 1
+                scope[Path] = base_path + [i]
+                item_path = _path_for_item(base_path, i)
+                yld = t
+                if self.subspec is not T:
+                    try:
+                        yld = scope[glom](t, self.subspec, scope)
+                    except Exception as e:
+                        if self._attempt is None:
+                            raise
+                        if not isinstance(e, GlomError):
+                            e = GlomError.wrap(e)
+                        original = _MISSING
+                        original_size = None
+                        original_omitted = False
+                        if self._attempt['keep_original']:
+                            original_size = _approx_size(t, original_budget)
+                            can_keep = (original_items is None
+                                        or original_items > 0)
+                            if original_budget is not None:
+                                can_keep = can_keep and original_size <= original_budget
+                                if can_keep:
+                                    original_budget -= original_size
+                            if can_keep:
+                                original = t
+                                if original_items is not None:
+                                    original_items -= 1
+                            else:
+                                original_omitted = True
+                        kind = 'missing' if isinstance(e, PathAccessError) else 'error'
+                        yield IterFailure(i, _iter_error_path(e, item_path), kind, e,
+                                          original=original,
+                                          error_chain=_error_chain(e),
+                                          original_size=original_size,
+                                          original_omitted=original_omitted,
+                                          item_path=item_path)
+                        continue
+                if yld is SKIP:
+                    continue
+                elif yld is self.sentinel or yld is STOP:
+                    # NB: sentinel defaults to STOP so I was torn whether
+                    # to also check for STOP, and landed on the side of
+                    # never letting STOP through.
+                    return
+                yield yld
+        finally:
+            _close_iterator(iterator)
         return
 
+    def _set_attempt(self, keep_original=False, original_budget=None,
+                     max_original_items=None):
+        if isinstance(keep_original, int) and not isinstance(keep_original, bool):
+            if original_budget is None:
+                original_budget = keep_original
+            keep_original = True
+        self._attempt = {
+            'subspec': self.subspec,
+            'keep_original': keep_original,
+            'original_budget': original_budget,
+            'max_original_items': max_original_items,
+        }
+
+    def attempt(self, subspec=_MISSING, keep_original=False,
+                max_original_bytes=None, original_budget=None,
+                max_original_items=None, **kwargs):
+        """Return a new :class:`Iter()` which yields one result per record.
+
+        Failures do not abort the stream. Instead of raising, a
+        :class:`IterFailure` is yielded with the source index, spec
+        location, and original :class:`~glom.GlomError` chain. Successful
+        records are yielded unchanged.
+
+        >>> target = [{'id': 1}, {}, {'id': 3}]
+        >>> spec = Iter().attempt(T['id']).all()
+        >>> results = glom(target, spec)
+        >>> [r for r in results if isinstance(r, IterFailure)][0].kind
+        'missing'
+
+        *keep_original* controls whether failed source values are
+        retained. *max_original_bytes* puts a byte budget on those
+        retained values across the stream; once the budget is spent,
+        later failures omit their originals. *max_original_items* can
+        limit the number of retained originals. SKIP and STOP keep their
+        normal filtering/termination behavior.
+        """
+        if kwargs:
+            # A few intuitive aliases, kept keyword-only in spirit.
+            if max_original_bytes is None:
+                max_original_bytes = kwargs.pop('max_original_size', None)
+            if max_original_bytes is None:
+                max_original_bytes = kwargs.pop('max_original_bytes', None)
+            if original_budget is None:
+                original_budget = kwargs.pop('original_limit', None)
+            if not kwargs:
+                pass
+            else:
+                raise TypeError('unexpected keyword arguments: %r' % sorted(kwargs))
+
+        if original_budget is None:
+            original_budget = max_original_bytes
+        if isinstance(keep_original, int) and not isinstance(keep_original, bool):
+            if original_budget is None:
+                original_budget = keep_original
+            keep_original = True
+
+        new_iter = type(self)(subspec=self.subspec, sentinel=self.sentinel,
+                              _iter_stack=self._iter_stack,
+                              _attempt=self._attempt)
+        if subspec is not _MISSING:
+            new_iter.subspec = subspec
+        new_iter._set_attempt(keep_original=keep_original,
+                              original_budget=original_budget,
+                              max_original_items=max_original_items)
+        return new_iter
+
     def _add_op(self, opname, args, callback):
-        return type(self)(subspec=self.subspec, _iter_stack=[(opname, args, callback)] + self._iter_stack)
+        return type(self)(subspec=self.subspec, sentinel=self.sentinel,
+                          _iter_stack=[(opname, args, callback)] + self._iter_stack,
+                          _attempt=self._attempt)
 
     def map(self, subspec):
         """Return a new :class:`Iter()` spec which will apply the provided

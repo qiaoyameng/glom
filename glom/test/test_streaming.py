@@ -2,8 +2,8 @@ import pytest
 
 from itertools import count, dropwhile, chain
 
-from glom import Iter
-from glom import glom, SKIP, STOP, T, Call, Spec, Glommer, Check, SKIP
+from glom import Iter, IterFailure
+from glom import glom, SKIP, STOP, T, Call, Spec, Glommer, Check, Path, GlomError
 
 
 RANGE_5 = list(range(5))
@@ -207,3 +207,104 @@ def test_all():
     assert out == list(range(10))
     assert next(int_iter, None) is None
     assert repr(Iter().all()) == 'Pipe(Iter(), list)'
+
+
+class SourceError(Exception):
+    pass
+
+
+class OneShotSource:
+    def __init__(self, records, error):
+        self.records = records
+        self.error = error
+        self.index = 0
+        self.closed = False
+        self.iterated = False
+
+    def __iter__(self):
+        if self.iterated:
+            raise RuntimeError('source was iterated twice')
+        self.iterated = True
+        return self
+
+    def __next__(self):
+        if self.index >= len(self.records):
+            raise self.error
+        value = self.records[self.index]
+        self.index += 1
+        return value
+
+    def close(self):
+        self.closed = True
+
+
+def test_attempt_failure_then_source_error():
+    source = OneShotSource(['1', 'bad', '3'], SourceError('source failed'))
+    out = glom(source, Iter().attempt(int))
+
+    assert next(out) == 1
+
+    failure = next(out)
+    assert isinstance(failure, IterFailure)
+    assert failure.index == 1
+    assert failure.path == Path(1)
+    assert failure.kind == 'error'
+    assert failure.error is not None
+    assert isinstance(failure.error, GlomError)
+    assert failure.error_chain
+    assert isinstance(failure.root_error, ValueError)
+
+    # The failure did not stop the stream or consume the next record.
+    assert next(out) == 3
+
+    # A failure from the source itself terminates iteration. It is not
+    # converted into another per-record failure item.
+    with pytest.raises(SourceError):
+        next(out)
+    assert source.closed
+
+
+def test_attempt_missing_skip_and_stop():
+    target = [{'id': 1}, {}, {'id': 3}]
+    out = list(glom(target, Iter().attempt(T['id'])))
+
+    assert out[0] == 1
+    assert isinstance(out[1], IterFailure)
+    assert out[1].kind == 'missing'
+    assert out[1].path == Path(1, 'id')
+    assert out[1].spec_path == Path('id')
+    assert out[2] == 3
+
+    # SKIP still filters and STOP still terminates in attempt mode.
+    assert list(glom([1, SKIP, 2, STOP, 3], Iter(attempt=True))) == [1, 2]
+
+
+def test_attempt_callback_runs_once_per_record():
+    calls = []
+
+    def parse(value):
+        calls.append(value)
+        return int(value)
+
+    out = glom(['1', 'bad', '3'], Iter().attempt(parse))
+    assert next(out) == 1
+    assert calls == ['1']
+    assert isinstance(next(out), IterFailure)
+    assert calls == ['1', 'bad']
+    assert next(out) == 3
+    assert calls == ['1', 'bad', '3']
+
+
+def test_attempt_original_budget_and_early_close():
+    out = list(glom(['bad'], Iter().attempt(
+        int, keep_original=True, max_original_bytes=0).all()))
+    assert out[0].original is None or not out[0].has_original
+    assert out[0].original_omitted
+
+    source = OneShotSource(['1', '2'], SourceError('finished'))
+    out = glom(source, Iter().attempt(int))
+    assert next(out) == 1
+    out.close()
+    assert source.closed
+    with pytest.raises(StopIteration):
+        next(out)
