@@ -49,3 +49,12 @@ from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 from glom.streaming import Iter
 
 from glom._version import __version__
+
+from glom.spec_analysis import (
+    analyze_spec,
+    SpecAnalysis,
+    SpecIssue,
+    MAYBE_MISSING,
+    DEFINITELY_MISSING,
+    UNKNOWN,
+)

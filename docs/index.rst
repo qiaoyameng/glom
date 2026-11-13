@@ -61,6 +61,7 @@ There's much, much more to glom, check out the :doc:`tutorial` and :doc:`API ref
    by_analogy
    snippets
    cli
+   spec_analysis
 
 .. toctree::
    :maxdepth: 2

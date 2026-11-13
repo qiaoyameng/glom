@@ -12,6 +12,17 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `glom.analyze_spec()`, a read-only static analyzer that checks a
+  glom spec against a declared `TypedDict`, dataclass, or `typing`
+  type. It reports the inferred output type, optional-field paths that
+  can fail at runtime (`maybe_missing`), paths that access undeclared
+  fields (`definite_errors`), and unverifiable fragments (`unknown`).
+  Analysis never constructs a target, never calls functions or getters,
+  and never modifies the handler registry; an unknown branch always
+  blocks `SpecAnalysis.fully_verified`.
+
 ## 25.12.0
 
 _(December 28, 2025)_
